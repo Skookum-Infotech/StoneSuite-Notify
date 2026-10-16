@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1504,5 +1505,68 @@ func TestCreate_IdempotencyKeyReplayReturnsSameIDsAndEnqueuesOnce(t *testing.T) 
 	}
 	if len(deliv.rows) != enqueuedAfterFirst {
 		t.Fatalf("deliveries = %d after replay, want %d (no re-enqueue)", len(deliv.rows), enqueuedAfterFirst)
+	}
+}
+
+func TestCreate_InvalidIdempotencyKeyReturns400AndCreatesNothing(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+	}{
+		{"oversized", strings.Repeat("k", maxIdempotencyKeyBytes+1)},
+		{"control character", "rule:inv\x00oice"},
+		{"newline", "rule:\ninvoice"},
+		{"del", "rule:\x7finvoice"},
+		{"composed key over column width", strings.Repeat("k", maxIdempotencyKeyBytes)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeStore{}
+			deliv := &fakeDeliveriesStore{}
+			h := newTestHandler(store, newFakePreferencesStore(), deliv, config.Config{})
+
+			email := "u1@example.com"
+			if tc.name == "composed key over column width" {
+				email = strings.Repeat("a", 100) + "@example.com"
+			}
+			body, _ := json.Marshal(createNotificationRequest{
+				TenantID:       "t1",
+				Recipients:     []recipientTarget{{UserID: "00000000-0000-4000-8000-000000000002", Email: email}},
+				EventType:      "automation.reminder",
+				Resource:       "invoice",
+				ResourceID:     "inv-1",
+				Title:          "Invoice due",
+				IdempotencyKey: tc.key,
+			})
+			req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader(body))
+			rec := httptest.NewRecorder()
+			h.Create(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+			}
+			if len(store.rows) != 0 || len(deliv.rows) != 0 {
+				t.Fatalf("rows=%d deliveries=%d, want nothing created", len(store.rows), len(deliv.rows))
+			}
+		})
+	}
+}
+
+func TestCreate_MaxLengthIdempotencyKeyAccepted(t *testing.T) {
+	store := &fakeStore{}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
+	body, _ := json.Marshal(createNotificationRequest{
+		TenantID:       "t1",
+		Recipients:     []recipientTarget{{UserID: "00000000-0000-4000-8000-000000000002", Email: "u1@example.com"}},
+		EventType:      "automation.reminder",
+		Resource:       "invoice",
+		ResourceID:     "inv-1",
+		Title:          "Invoice due",
+		IdempotencyKey: strings.Repeat("k", maxIdempotencyKeyBytes),
+	})
+	rec := httptest.NewRecorder()
+	h.Create(rec, httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader(body)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
 	}
 }

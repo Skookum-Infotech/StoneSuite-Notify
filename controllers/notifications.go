@@ -246,6 +246,30 @@ type createNotificationRequest struct {
 
 const channelEmail = "email"
 
+// Idempotency key bounds. maxIdempotencyKeyBytes caps the caller's base key;
+// maxStoredIdempotencyKeyBytes is the notifications.idempotency_key column
+// width (VARCHAR(255)) that the composed per-recipient key must fit in.
+const (
+	maxIdempotencyKeyBytes       = 128
+	maxStoredIdempotencyKeyBytes = 255
+	maxControlRune               = 0x20 // runes below this are control characters
+	deleteRune                   = 0x7f
+)
+
+// validateIdempotencyKey rejects a caller key that is too long or contains
+// control characters. An empty key is valid (idempotency is opt-in).
+func validateIdempotencyKey(key string) error {
+	if len(key) > maxIdempotencyKeyBytes {
+		return errors.New("idempotencyKey must be at most 128 bytes.")
+	}
+	for _, r := range key {
+		if r < maxControlRune || r == deleteRune {
+			return errors.New("idempotencyKey must not contain control characters.")
+		}
+	}
+	return nil
+}
+
 // Create handles POST /api/notifications/internal — called by another
 // StoneSuite service (not an end user) when a business event fires. Gated
 // by middleware.RequireInternalSecret rather than end-user auth.
@@ -262,6 +286,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Recipients) == 0 {
 		fail(w, http.StatusBadRequest, "recipients is required.")
+		return
+	}
+
+	if err := validateIdempotencyKey(req.IdempotencyKey); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -306,6 +335,12 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.IdempotencyKey != "" {
 			in.IdempotencyKey = req.IdempotencyKey + ":" + recipient.UserID + ":" + strings.ToLower(recipient.Email)
+			// The composed key must fit the column; a long recipient email can
+			// push it over, which would otherwise fail the INSERT silently.
+			if len(in.IdempotencyKey) > maxStoredIdempotencyKeyBytes {
+				fail(w, http.StatusBadRequest, "idempotencyKey combined with the recipient is too long.")
+				return
+			}
 		}
 		if err := in.Validate(); err != nil {
 			fail(w, http.StatusBadRequest, err.Error())
