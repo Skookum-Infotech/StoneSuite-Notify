@@ -225,3 +225,9 @@ ALTER TABLE notification_attachments ADD COLUMN IF NOT EXISTS email_body_html TE
 -- which is workers-only and not tenant-scoped.
 CREATE INDEX IF NOT EXISTS idx_deliveries_tenant_status
     ON notification_deliveries (tenant_id, status, updated_at DESC);
+
+-- Idempotency for callers that may retry after a timeout (automation engine):
+-- the same (tenant, key) never creates a second notification or delivery.
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(255);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_tenant_idempotency
+    ON notifications (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;

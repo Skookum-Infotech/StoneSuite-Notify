@@ -30,6 +30,9 @@ type fakeNotifications struct {
 func (f *fakeNotifications) Create(_ context.Context, _ notifications.CreateInput) (*notifications.Notification, error) {
 	return nil, nil
 }
+func (f *fakeNotifications) CreateIdempotent(_ context.Context, _ notifications.CreateInput) (*notifications.Notification, bool, error) {
+	return nil, false, nil
+}
 func (f *fakeNotifications) Get(_ context.Context, _, id string) (*notifications.Notification, error) {
 	n, ok := f.byID[id]
 	if !ok {

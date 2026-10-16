@@ -44,6 +44,9 @@ type CreateInput struct {
 	Body            string `json:"body,omitempty"`
 	Link            string `json:"link,omitempty"`
 	VisibleInApp    bool   `json:"visibleInApp"`
+	// IdempotencyKey, when set, makes creation idempotent per (tenant, key):
+	// a replay returns the original row instead of inserting another.
+	IdempotencyKey string `json:"idempotencyKey,omitempty"`
 }
 
 // AttachmentInput is the optional per-notification content only the email
