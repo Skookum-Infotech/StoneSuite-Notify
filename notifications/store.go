@@ -18,6 +18,10 @@ var ErrNotFound = errors.New("notification not found")
 // this interface (not *PGStore) so they can be tested with a fake store.
 type Store interface {
 	Create(ctx context.Context, in CreateInput) (*Notification, error)
+	// CreateIdempotent behaves like Create, but when in.IdempotencyKey is set
+	// and a row with the same (tenant, key) exists it returns that row with
+	// created=false instead of inserting another.
+	CreateIdempotent(ctx context.Context, in CreateInput) (n *Notification, created bool, err error)
 	// Get loads a single notification by id, scoped to tenant only (not
 	// recipient) — used by the delivery workers to read title/body/link/
 	// recipient_email fresh at send time via notification_id.
@@ -269,4 +273,46 @@ func (s *PGStore) GetAttachment(ctx context.Context, tenantID, notificationID st
 		return nil, fmt.Errorf("get notification attachment %s: %w", notificationID, err)
 	}
 	return &a, nil
+}
+
+// CreateIdempotent inserts like Create, but when in.IdempotencyKey is set and a
+// row with the same (tenant, key) exists it returns that row with created=false.
+func (s *PGStore) CreateIdempotent(ctx context.Context, in CreateInput) (*Notification, bool, error) {
+	if in.IdempotencyKey == "" {
+		n, err := s.Create(ctx, in)
+		return n, err == nil, err
+	}
+	var actorUserIDArg any
+	if in.ActorUserID != "" {
+		actorUserIDArg = in.ActorUserID
+	}
+	var recipientUserIDArg any
+	if in.RecipientUserID != "" {
+		recipientUserIDArg = in.RecipientUserID
+	}
+
+	// The insert and the conflict are atomic in Postgres, so concurrent
+	// callers with one key yield exactly one row; the losers fall through to
+	// the SELECT below.
+	row := s.pool.QueryRow(ctx, `
+		INSERT INTO notifications
+			(tenant_id, recipient_user_id, recipient_email, actor_user_id, event_type, resource, resource_id, title, body, link, visible_in_app, idempotency_key)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+		RETURNING `+notificationColumns,
+		in.TenantID, recipientUserIDArg, in.RecipientEmail, actorUserIDArg, in.EventType, in.Resource, in.ResourceID, in.Title, in.Body, in.Link, in.VisibleInApp, in.IdempotencyKey)
+	n, err := scanNotification(row)
+	if err == nil {
+		return n, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, fmt.Errorf("create notification (idempotent): %w", err)
+	}
+	existing, err := scanNotification(s.pool.QueryRow(ctx,
+		`SELECT `+notificationColumns+` FROM notifications WHERE tenant_id = $1 AND idempotency_key = $2`,
+		in.TenantID, in.IdempotencyKey))
+	if err != nil {
+		return nil, false, fmt.Errorf("load idempotent notification: %w", err)
+	}
+	return existing, false, nil
 }

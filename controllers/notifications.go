@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"stonesuite-notify/audit"
@@ -237,6 +238,10 @@ type createNotificationRequest struct {
 	// is used, since a notification carries at most one file today
 	// (notification_attachments is one row per notification_id).
 	Attachments []attachmentInput `json:"attachments,omitempty"`
+	// IdempotencyKey makes a retried request safe. It is scoped per
+	// recipient (key + userId + email) because one request fans out to many
+	// notifications; a replay returns the original rows and enqueues nothing.
+	IdempotencyKey string `json:"idempotencyKey,omitempty"`
 }
 
 const channelEmail = "email"
@@ -299,6 +304,9 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 			Body:            req.Body,
 			Link:            req.Link,
 		}
+		if req.IdempotencyKey != "" {
+			in.IdempotencyKey = req.IdempotencyKey + ":" + recipient.UserID + ":" + strings.ToLower(recipient.Email)
+		}
 		if err := in.Validate(); err != nil {
 			fail(w, http.StatusBadRequest, err.Error())
 			return
@@ -346,12 +354,15 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 
 	created := make([]*notifications.Notification, 0, len(planned))
 	for _, p := range planned {
-		n, err := h.Store.Create(r.Context(), p.input)
+		n, isNew, err := h.Store.CreateIdempotent(r.Context(), p.input)
 		if err != nil {
 			log.Printf("notifications: create for recipient %s: %v", p.input.RecipientUserID, err)
 			continue
 		}
 		created = append(created, n)
+		if !isNew {
+			continue // replay: attachment, deliveries and audit came from the original request
+		}
 		if attachment != nil && wantsEmail && p.prefs.EmailEnabled {
 			if err := h.Store.SaveAttachment(r.Context(), n.ID, *attachment); err != nil {
 				log.Printf("notifications: save attachment for %s: %v", n.ID, err)
