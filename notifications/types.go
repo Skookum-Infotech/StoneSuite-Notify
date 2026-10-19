@@ -66,7 +66,23 @@ type AttachmentInput struct {
 	ContentType   string
 	Content       []byte
 	EmailBodyHTML string
+	EmailOptions  EmailOptions
 }
+
+// EmailOptions are the per-message header overrides persisted with the
+// attachment row and read back by the email delivery worker: a Reply-To that
+// routes a customer's reply to a specific record, a human sender name, and the
+// threading headers that keep a reply inside its Gmail/Outlook conversation.
+// The zero value means "use the service-wide defaults".
+type EmailOptions struct {
+	ReplyTo    string `json:"replyTo,omitempty"`
+	FromName   string `json:"fromName,omitempty"`
+	InReplyTo  string `json:"inReplyTo,omitempty"`
+	References string `json:"references,omitempty"`
+}
+
+// IsZero reports whether no override is set.
+func (o EmailOptions) IsZero() bool { return o == EmailOptions{} }
 
 // Paging bounds for the feed. DefaultPageSize matches what the bell
 // dropdown asks for; MaxPageSize caps the "view all" screen so no caller

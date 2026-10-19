@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"stonesuite-notify/emailevents"
+	"stonesuite-notify/inbound"
 	"stonesuite-notify/models"
 )
 
@@ -23,10 +25,19 @@ const (
 	maxWebhookBodyBytes = 1 << 20
 	maxStatusRequestIDs = 200
 	maxEventDetailRunes = 500
+
+	// inboundTimeout bounds fetching a received mail and forwarding it; it covers
+	// the backend's scale-to-zero cold start with room to spare.
+	inboundTimeout = 30 * time.Second
 )
 
 // uuidPattern guards the status endpoint's ids before they reach a ::uuid cast.
 var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// InboundProcessor handles a received customer reply (inbound.Processor).
+type InboundProcessor interface {
+	Process(ctx context.Context, ev inbound.Event) (inbound.Outcome, error)
+}
 
 // EmailEventsHandler serves the provider-webhook receiver and the internal
 // email-status read. Now is injectable so tests can pin the replay window.
@@ -34,12 +45,20 @@ type EmailEventsHandler struct {
 	Store  emailevents.Store
 	Secret string
 	Now    func() time.Time
+	// Inbound handles email.received events; nil acknowledges and drops them.
+	Inbound InboundProcessor
 }
 
 // NewEmailEventsHandler builds the handler. An empty secret is allowed: the
 // webhook route then answers 503 (see Resend).
 func NewEmailEventsHandler(store emailevents.Store, secret string) *EmailEventsHandler {
 	return &EmailEventsHandler{Store: store, Secret: secret, Now: time.Now}
+}
+
+// WithInbound enables handling of email.received events and returns h.
+func (h *EmailEventsHandler) WithInbound(p InboundProcessor) *EmailEventsHandler {
+	h.Inbound = p
+	return h
 }
 
 // resendWebhook is the subset of Resend's webhook payload notify reads. The
@@ -87,7 +106,8 @@ func (w resendWebhook) detail() string {
 }
 
 // Resend handles POST /api/webhooks/resend — Resend reporting what happened to
-// an email after accepting it. It is public (Resend holds no StoneSuite
+// an email after accepting it, and delivering a customer's reply received on the
+// reply domain (email.received). It is public (Resend holds no StoneSuite
 // credentials); the Svix signature is its only gate, so nothing is read from
 // the payload before it verifies.
 func (h *EmailEventsHandler) Resend(w http.ResponseWriter, r *http.Request) {
@@ -122,6 +142,10 @@ func (h *EmailEventsHandler) Resend(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "Invalid request body.")
 		return
 	}
+	if evt.Type == inbound.EventEmailReceived {
+		h.receiveInbound(w, r, body)
+		return
+	}
 	if _, relevant := emailevents.StatusForEvent(evt.Type); !relevant || evt.Data.EmailID == "" {
 		writeJSON(w, http.StatusOK, models.APIResponse{Success: true})
 		return
@@ -146,6 +170,40 @@ func (h *EmailEventsHandler) Resend(w http.ResponseWriter, r *http.Request) {
 	log.Printf("emailevents: event=%s matched=%v duplicate=%v changed=%v alerted=%v status=%s",
 		evt.Type, res.Matched, res.Duplicate, res.Changed, res.Alerted, res.Status)
 
+	writeJSON(w, http.StatusOK, models.APIResponse{Success: true})
+}
+
+// receiveInbound hands a verified email.received event to the inbound processor.
+// The status code drives Resend's retries: a failure a retry could fix (Resend or
+// the backend unreachable or erroring) answers 502; anything else — handled,
+// not ours, not set up, or unfixable — answers 200 so the shared endpoint is not
+// failed (and eventually disabled by Resend) over mail no retry can file.
+func (h *EmailEventsHandler) receiveInbound(w http.ResponseWriter, r *http.Request, body []byte) {
+	if h.Inbound == nil {
+		log.Printf("inbound: event=email_received_dropped reason=%q",
+			"inbound reply forwarding is not configured (REPLY_EMAIL_DOMAIN, BACKEND_URL, RESEND_API_KEY)")
+		writeJSON(w, http.StatusOK, models.APIResponse{Success: true})
+		return
+	}
+	ev, err := inbound.ParseEvent(body)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "Invalid request body.")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), inboundTimeout)
+	defer cancel()
+	outcome, err := h.Inbound.Process(ctx, ev)
+	switch {
+	case err == nil:
+		log.Printf("inbound: event=email_received email=%s outcome=%s", ev.Data.EmailID, outcome)
+	case inbound.IsRetryable(err):
+		log.Printf("inbound: event=email_received_retry email=%s error=%v", ev.Data.EmailID, err)
+		fail(w, http.StatusBadGateway, "Failed to process the inbound email.")
+		return
+	default:
+		log.Printf("inbound: event=email_received_dropped email=%s error=%v", ev.Data.EmailID, err)
+	}
 	writeJSON(w, http.StatusOK, models.APIResponse{Success: true})
 }
 

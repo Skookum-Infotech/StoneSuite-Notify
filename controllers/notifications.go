@@ -8,7 +8,9 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"net/mail"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -244,6 +246,50 @@ type createNotificationRequest struct {
 	// is used, since a notification carries at most one file today
 	// (notification_attachments is one row per notification_id).
 	Attachments []attachmentInput `json:"attachments,omitempty"`
+	// Per-message email header overrides — see notifications.EmailOptions.
+	// EmailReplyTo routes the customer's reply to a specific record's
+	// inbound address; EmailFromName shows a person ("Harish (Acme)") as the
+	// sender; EmailInReplyTo/EmailReferences keep a reply in its mail thread.
+	EmailReplyTo    string `json:"emailReplyTo,omitempty"`
+	EmailFromName   string `json:"emailFromName,omitempty"`
+	EmailInReplyTo  string `json:"emailInReplyTo,omitempty"`
+	EmailReferences string `json:"emailReferences,omitempty"`
+}
+
+// emailOptions validates and converts the request's header overrides. A value
+// containing CR/LF is rejected outright (header injection), and the reply-to
+// must be a single well-formed address.
+func (r createNotificationRequest) emailOptions() (notifications.EmailOptions, error) {
+	opts := notifications.EmailOptions{
+		ReplyTo:    strings.TrimSpace(r.EmailReplyTo),
+		FromName:   strings.TrimSpace(r.EmailFromName),
+		InReplyTo:  strings.TrimSpace(r.EmailInReplyTo),
+		References: strings.TrimSpace(r.EmailReferences),
+	}
+	limits := []struct {
+		name  string
+		value string
+		max   int
+	}{
+		{"emailReplyTo", opts.ReplyTo, maxEmailReplyToChars},
+		{"emailFromName", opts.FromName, maxEmailFromNameChars},
+		{"emailInReplyTo", opts.InReplyTo, maxEmailMessageIDChars},
+		{"emailReferences", opts.References, maxEmailReferencesChars},
+	}
+	for _, f := range limits {
+		if strings.ContainsAny(f.value, "\r\n") {
+			return notifications.EmailOptions{}, errors.New(f.name + " must not contain line breaks.")
+		}
+		if utf8.RuneCountInString(f.value) > f.max {
+			return notifications.EmailOptions{}, errors.New(f.name + " is too long.")
+		}
+	}
+	if opts.ReplyTo != "" {
+		if _, err := mail.ParseAddress(opts.ReplyTo); err != nil {
+			return notifications.EmailOptions{}, errors.New("emailReplyTo must be a valid email address.")
+		}
+	}
+	return opts, nil
 }
 
 const channelEmail = "email"
@@ -252,6 +298,15 @@ const channelEmail = "email"
 const (
 	maxStatusLinkChars     = 300
 	maxStatusResourceChars = 64
+)
+
+// Bounds on the per-message email header overrides. References can carry a
+// whole thread's Message-IDs, so it gets the most room.
+const (
+	maxEmailReplyToChars    = 254
+	maxEmailFromNameChars   = 100
+	maxEmailMessageIDChars  = 998
+	maxEmailReferencesChars = 4000
 )
 
 // Create handles POST /api/notifications/internal — called by another
@@ -281,9 +336,15 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	emailOpts, optsErr := req.emailOptions()
+	if optsErr != nil {
+		fail(w, http.StatusBadRequest, optsErr.Error())
+		return
+	}
+
 	var attachment *notifications.AttachmentInput
-	if len(req.Attachments) > 0 || req.EmailBodyHTML != "" {
-		attachment = &notifications.AttachmentInput{EmailBodyHTML: req.EmailBodyHTML}
+	if len(req.Attachments) > 0 || req.EmailBodyHTML != "" || !emailOpts.IsZero() {
+		attachment = &notifications.AttachmentInput{EmailBodyHTML: req.EmailBodyHTML, EmailOptions: emailOpts}
 		if len(req.Attachments) > 0 {
 			a := req.Attachments[0]
 			content, decErr := base64.StdEncoding.DecodeString(a.ContentBase64)

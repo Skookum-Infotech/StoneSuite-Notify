@@ -219,6 +219,12 @@ ALTER TABLE notification_deliveries ALTER COLUMN recipient_user_id DROP NOT NULL
 -- the generic template"; see channels.SendNotificationEmail.
 ALTER TABLE notification_attachments ADD COLUMN IF NOT EXISTS email_body_html TEXT NOT NULL DEFAULT '';
 
+-- Optional per-notification email header overrides (reply_to, from name,
+-- In-Reply-To / References), JSON of notifications.EmailOptions. Lets a caller
+-- route a customer's reply to a specific record and keep it in the same mail
+-- thread. '{}' means "use the service-wide defaults".
+ALTER TABLE notification_attachments ADD COLUMN IF NOT EXISTS email_options JSONB NOT NULL DEFAULT '{}'::jsonb;
+
 -- Serves the "list a tenant's deliveries by status since T" query
 -- (deliveries.Store.ListByStatus) behind the admin/ops "what failed?"
 -- view. Distinct from idx_deliveries_claim (status, next_attempt_at),

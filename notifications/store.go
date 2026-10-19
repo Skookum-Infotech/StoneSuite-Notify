@@ -2,6 +2,7 @@ package notifications
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -254,15 +255,20 @@ func (s *PGStore) SaveAttachment(ctx context.Context, notificationID string, a A
 	if content == nil {
 		content = []byte{}
 	}
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO notification_attachments (notification_id, file_name, content_type, content, email_body_html)
-		VALUES ($1, $2, $3, $4, $5)
+	options, err := json.Marshal(a.EmailOptions)
+	if err != nil {
+		return fmt.Errorf("encode email options for notification %s: %w", notificationID, err)
+	}
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO notification_attachments (notification_id, file_name, content_type, content, email_body_html, email_options)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (notification_id) DO UPDATE
 			SET file_name = EXCLUDED.file_name,
 			    content_type = EXCLUDED.content_type,
 			    content = EXCLUDED.content,
-			    email_body_html = EXCLUDED.email_body_html`,
-		notificationID, a.FileName, a.ContentType, content, a.EmailBodyHTML)
+			    email_body_html = EXCLUDED.email_body_html,
+			    email_options = EXCLUDED.email_options`,
+		notificationID, a.FileName, a.ContentType, content, a.EmailBodyHTML, options)
 	if err != nil {
 		return fmt.Errorf("save notification attachment %s: %w", notificationID, err)
 	}
@@ -276,17 +282,23 @@ func (s *PGStore) SaveAttachment(ctx context.Context, notificationID string, a A
 // the common case.
 func (s *PGStore) GetAttachment(ctx context.Context, tenantID, notificationID string) (*AttachmentInput, error) {
 	var a AttachmentInput
+	var options []byte
 	err := s.pool.QueryRow(ctx, `
-		SELECT na.file_name, na.content_type, na.content, na.email_body_html
+		SELECT na.file_name, na.content_type, na.content, na.email_body_html, na.email_options
 		FROM notification_attachments na
 		JOIN notifications n ON n.id = na.notification_id
 		WHERE na.notification_id = $1 AND n.tenant_id = $2`,
-		notificationID, tenantID).Scan(&a.FileName, &a.ContentType, &a.Content, &a.EmailBodyHTML)
+		notificationID, tenantID).Scan(&a.FileName, &a.ContentType, &a.Content, &a.EmailBodyHTML, &options)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("get notification attachment %s: %w", notificationID, err)
+	}
+	if len(options) > 0 {
+		if err := json.Unmarshal(options, &a.EmailOptions); err != nil {
+			return nil, fmt.Errorf("decode email options for notification %s: %w", notificationID, err)
+		}
 	}
 	return &a, nil
 }

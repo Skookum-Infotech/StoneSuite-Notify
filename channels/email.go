@@ -14,6 +14,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/mail"
 	"net/smtp"
 	"net/textproto"
 	"regexp"
@@ -40,6 +41,64 @@ type EmailAttachment struct {
 	Content     []byte
 }
 
+// EmailOptions are the per-message header overrides a caller can request on
+// top of the service-wide defaults: a Reply-To that routes a customer's reply
+// back to a specific record, a human sender name, and the threading headers
+// that make Gmail/Outlook keep a reply in the same conversation. The zero value
+// changes nothing.
+type EmailOptions struct {
+	ReplyTo    string
+	FromName   string
+	InReplyTo  string
+	References string
+}
+
+// replyTo returns the Reply-To to use: the per-message one when set, else the
+// service-wide EMAIL_REPLY_TO.
+func (o EmailOptions) replyTo(cfg config.Config) string {
+	if o.ReplyTo != "" {
+		return sanitizeHeader(o.ReplyTo)
+	}
+	return cfg.EmailReplyTo
+}
+
+// from returns the From header value: the configured sender address, shown
+// under FromName when one is given. mail.Address quotes and RFC 2047-encodes
+// the name, so a name with commas, quotes or non-ASCII text stays valid.
+func (o EmailOptions) from(cfg config.Config) string {
+	name := sanitizeHeader(o.FromName)
+	if name == "" {
+		return cfg.EmailFrom
+	}
+	parsed, err := mail.ParseAddress(cfg.EmailFrom)
+	if err != nil {
+		return cfg.EmailFrom
+	}
+	return (&mail.Address{Name: name, Address: parsed.Address}).String()
+}
+
+// threadHeaders returns the In-Reply-To / References pair for a reply, or nil
+// when neither is set.
+func (o EmailOptions) threadHeaders() map[string]string {
+	h := map[string]string{}
+	if v := sanitizeHeader(o.InReplyTo); v != "" {
+		h["In-Reply-To"] = v
+	}
+	if v := sanitizeHeader(o.References); v != "" {
+		h["References"] = v
+	}
+	if len(h) == 0 {
+		return nil
+	}
+	return h
+}
+
+// sanitizeHeader drops CR/LF so a caller-supplied value can never inject an
+// extra header line into the message.
+func sanitizeHeader(v string) string {
+	return strings.TrimSpace(strings.NewReplacer("\r", "", "\n", "").Replace(v))
+}
+
 // SendNotificationEmail delivers a notification over email, choosing a
 // provider the same way StoneSuite-Backend's services/email.go does:
 // Resend if configured, else SMTP. A missing provider or a missing
@@ -55,7 +114,7 @@ type EmailAttachment struct {
 // It returns the provider's id for the sent email (Resend only; "" for SMTP),
 // which the worker stores so the provider's delivery webhooks can be matched
 // to this delivery.
-func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHTML string, attachment *EmailAttachment) (string, error) {
+func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHTML string, attachment *EmailAttachment, opts EmailOptions) (string, error) {
 	if to == "" {
 		return "", fmt.Errorf("email channel: recipient address is empty")
 	}
@@ -82,9 +141,9 @@ func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHT
 
 	switch {
 	case cfg.ResendAPIKey != "":
-		return sendViaResend(cfg, to, title, htmlBody, textBody, attachment)
+		return sendViaResend(cfg, to, title, htmlBody, textBody, attachment, opts)
 	case cfg.SMTPHost != "":
-		return "", sendViaSMTP(cfg, to, title, htmlBody, textBody, attachment)
+		return "", sendViaSMTP(cfg, to, title, htmlBody, textBody, attachment, opts)
 	default:
 		// A delivery row only reaches this worker because Create decided
 		// email was wanted and enabled — so "no provider" here is a
@@ -144,6 +203,7 @@ type resendRequest struct {
 	From        string             `json:"from"`
 	To          string             `json:"to"`
 	ReplyTo     string             `json:"reply_to,omitempty"`
+	Headers     map[string]string  `json:"headers,omitempty"`
 	Subject     string             `json:"subject"`
 	HTML        string             `json:"html"`
 	Text        string             `json:"text,omitempty"`
@@ -157,11 +217,12 @@ type resendResponse struct {
 
 // sendViaResend sends through Resend and returns Resend's id for the accepted
 // email ("" if the response carried none).
-func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, attachment *EmailAttachment) (string, error) {
+func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, attachment *EmailAttachment, opts EmailOptions) (string, error) {
 	req := resendRequest{
-		From:    cfg.EmailFrom,
+		From:    opts.from(cfg),
 		To:      to,
-		ReplyTo: cfg.EmailReplyTo,
+		ReplyTo: opts.replyTo(cfg),
+		Headers: opts.threadHeaders(),
 		Subject: subject,
 		HTML:    htmlBody,
 		Text:    textBody,
@@ -209,9 +270,9 @@ func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, at
 	return accepted.ID, nil
 }
 
-func sendViaSMTP(cfg config.Config, to, subject, htmlBody, textBody string, attachment *EmailAttachment) error {
+func sendViaSMTP(cfg config.Config, to, subject, htmlBody, textBody string, attachment *EmailAttachment, opts EmailOptions) error {
 	addr := cfg.SMTPHost + ":" + cfg.SMTPPort
-	msg := buildSMTPMessage(to, cfg.EmailFrom, cfg.EmailReplyTo, subject, htmlBody, textBody, attachment)
+	msg := buildSMTPMessage(to, opts.from(cfg), opts.replyTo(cfg), subject, htmlBody, textBody, attachment, opts)
 
 	var auth smtp.Auth
 	if cfg.SMTPUsername != "" {
@@ -254,13 +315,25 @@ func mimeBody(htmlBody, altText string) (contentType string, body []byte) {
 // a plain-text alternative is supplied; an attachment wraps that body in an
 // outer multipart/mixed. Mirrors the html/text/reply_to shape Resend builds,
 // so both providers deliver the same message.
-func buildSMTPMessage(to, from, replyTo, subject, htmlBody, textBody string, attachment *EmailAttachment) []byte {
+func buildSMTPMessage(to, from, replyTo, subject, htmlBody, textBody string, attachment *EmailAttachment, opts EmailOptions) []byte {
 	bodyCT, bodyBytes := mimeBody(htmlBody, textBody)
 
 	var buf bytes.Buffer
 	buf.WriteString("To: " + to + "\r\n")
+	// The From header is only written when a sender name was requested; the
+	// envelope sender (smtp.SendMail's from argument) is what the server
+	// authenticates, and an unnamed message keeps the provider's default.
+	if opts.FromName != "" {
+		buf.WriteString("From: " + from + "\r\n")
+	}
 	if replyTo != "" {
 		buf.WriteString("Reply-To: " + replyTo + "\r\n")
+	}
+	threading := opts.threadHeaders()
+	for _, name := range []string{"In-Reply-To", "References"} {
+		if v, ok := threading[name]; ok {
+			buf.WriteString(name + ": " + v + "\r\n")
+		}
 	}
 	buf.WriteString("Subject: " + subject + "\r\n")
 	buf.WriteString("MIME-Version: 1.0\r\n")
