@@ -23,6 +23,7 @@ import (
 	"stonesuite-notify/database"
 	"stonesuite-notify/deliveries"
 	"stonesuite-notify/emailevents"
+	"stonesuite-notify/inbound"
 	"stonesuite-notify/middleware"
 	"stonesuite-notify/notifications"
 	"stonesuite-notify/preferences"
@@ -62,6 +63,9 @@ func main() {
 	if !cfg.ResendWebhookConfigured() {
 		log.Println("notice: no RESEND_WEBHOOK_SECRET — Resend delivery webhooks will be rejected (503); provider delivery status will not be tracked")
 	}
+	if !cfg.InboundConfigured() {
+		log.Println("notice: inbound reply forwarding is off (needs REPLY_EMAIL_DOMAIN, BACKEND_URL and RESEND_API_KEY) — email.received webhooks will be acknowledged and dropped")
+	}
 	if !cfg.PushConfigured() {
 		log.Println("notice: no VAPID keys configured (VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY) — push channel will be skipped")
 	}
@@ -83,6 +87,15 @@ func main() {
 	prefHandler := controllers.NewPreferencesHandler(prefStore, auditRecorder)
 	auditHandler := controllers.NewAuditHandler(auditStore)
 	emailEventsHandler := controllers.NewEmailEventsHandler(emailEventsStore, cfg.ResendWebhookSecret)
+	if cfg.InboundConfigured() {
+		// A customer's reply, received by Resend, is fetched here and forwarded to
+		// the backend signed with the secret both services already share.
+		emailEventsHandler.WithInbound(inbound.Processor{
+			Domain:    cfg.ReplyEmailDomain,
+			Fetcher:   inbound.ResendFetcher{APIKey: cfg.ResendAPIKey},
+			Forwarder: inbound.HTTPForwarder{BackendURL: cfg.BackendURL, Secret: cfg.InternalServiceSecret},
+		})
+	}
 
 	workerDeps := workers.NewDeps(store, deliveryStore, pushStore, auditRecorder, cfg)
 	go workers.QueueConsumer{Deps: workerDeps}.Run(ctx)
@@ -104,8 +117,9 @@ func main() {
 		_, _ = w.Write([]byte(`{"success":true}`))
 	})
 
-	// Provider webhook: public by necessity (Resend holds no StoneSuite
-	// credentials). The Svix signature check inside the handler is its ONLY gate.
+	// Provider webhook (delivery status + received customer replies): public by
+	// necessity (Resend holds no StoneSuite credentials). The Svix signature check
+	// inside the handler is its ONLY gate.
 	mux.HandleFunc("POST /api/webhooks/resend", emailEventsHandler.Resend)
 
 	requireInternal := middleware.RequireInternalSecret(cfg.InternalServiceSecret)

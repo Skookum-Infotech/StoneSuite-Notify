@@ -26,6 +26,8 @@ Layering is store → handler, per top-level package:
 - `pushsubs/` — same store/interface pattern, for Web Push subscription rows (one per browser/device, upserted by `endpoint`).
 - `controllers/` — HTTP handlers translating requests to store calls. `Handler` (notifications) and `PushHandler` (web push) share the same package so they can share `writeJSON`/`fail` helpers.
 - `channels/` — fire-and-forget side-channel delivery (email via Resend-then-SMTP fallback, web push via VAPID). Failures here are logged, never surfaced to the create-notification response, since the in-app row is already the source of truth.
+- `emailevents/` — what Resend reports about an email after accepting it (delivered / bounced / …), via the public Svix-signed `POST /api/webhooks/resend`.
+- `inbound/` — a customer's reply received by Resend (`email.received` on that same webhook): fetches the mail from Resend's Receiving API and forwards it to StoneSuite-Backend's `POST /api/internal/email/inbound`, HMAC-signed with `INTERNAL_SERVICE_SECRET`. Needs `REPLY_EMAIL_DOMAIN` (must equal the backend's), `BACKEND_URL`, `RESEND_API_KEY`. Notify never decides which record a reply belongs to; the webhook answers 5xx only for failures a retry could fix, so one stuck forward cannot get the shared endpoint disabled by Resend.
 - `middleware/` — JWT auth and internal-secret auth.
 - `database/` — connection pool + schema application. `database/migrations/schema.sql` is embedded via `//go:embed` and applied on every boot; every statement is `IF NOT EXISTS`/idempotent, so there is no separate migration runner or version table — editing that file *is* the migration.
 - `models/` — the single shared `APIResponse{success, message, data}` envelope every handler returns.
