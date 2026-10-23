@@ -119,3 +119,77 @@ func TestAttachment_NotReadableUnderAnotherTenant(t *testing.T) {
 		t.Fatalf("another tenant must see nothing, got %v, %v", got, err)
 	}
 }
+
+func TestAttachment_SeveralFilesRoundTripInOrder(t *testing.T) {
+	store, id, tenantID := newStore(t)
+	ctx := context.Background()
+
+	in := notifications.AttachmentInput{
+		FileName: "plan.pdf", ContentType: "application/pdf", Content: []byte("one"),
+		MoreFiles: []notifications.AttachmentFile{
+			{FileName: "kitchen.jpg", ContentType: "image/jpeg", Content: []byte("two")},
+			{FileName: "notes.txt", ContentType: "text/plain", Content: []byte("three")},
+		},
+		EmailBodyHTML: "<p>See attached.</p>",
+	}
+	if err := store.SaveAttachment(ctx, id, in); err != nil {
+		t.Fatalf("SaveAttachment: %v", err)
+	}
+
+	got, err := store.GetAttachment(ctx, tenantID, id)
+	if err != nil || got == nil {
+		t.Fatalf("GetAttachment = %v, %v", got, err)
+	}
+	if got.FileName != "plan.pdf" || string(got.Content) != "one" {
+		t.Fatalf("first file = %q %q", got.FileName, got.Content)
+	}
+	if len(got.MoreFiles) != 2 || got.MoreFiles[0].FileName != "kitchen.jpg" || got.MoreFiles[1].FileName != "notes.txt" {
+		t.Fatalf("further files = %+v, want kitchen.jpg then notes.txt", got.MoreFiles)
+	}
+	if got.MoreFiles[0].ContentType != "image/jpeg" || string(got.MoreFiles[1].Content) != "three" {
+		t.Fatalf("a further file lost its type or content: %+v", got.MoreFiles)
+	}
+	if got.EmailBodyHTML != "<p>See attached.</p>" {
+		t.Fatalf("email body lost: %q", got.EmailBodyHTML)
+	}
+}
+
+func TestAttachment_ReplacingDropsTheEarlierFiles(t *testing.T) {
+	store, id, tenantID := newStore(t)
+	ctx := context.Background()
+	first := notifications.AttachmentInput{
+		FileName: "a.pdf", Content: []byte("a"),
+		MoreFiles: []notifications.AttachmentFile{{FileName: "b.pdf", Content: []byte("b")}, {FileName: "c.pdf", Content: []byte("c")}},
+	}
+	if err := store.SaveAttachment(ctx, id, first); err != nil {
+		t.Fatalf("SaveAttachment: %v", err)
+	}
+
+	// A retry saves a smaller set: the old second and third files must not linger.
+	second := notifications.AttachmentInput{FileName: "x.pdf", Content: []byte("x"), MoreFiles: []notifications.AttachmentFile{{FileName: "y.pdf", Content: []byte("y")}}}
+	if err := store.SaveAttachment(ctx, id, second); err != nil {
+		t.Fatalf("SaveAttachment (replace): %v", err)
+	}
+
+	got, err := store.GetAttachment(ctx, tenantID, id)
+	if err != nil || got == nil {
+		t.Fatalf("GetAttachment = %v, %v", got, err)
+	}
+	if got.FileName != "x.pdf" || len(got.MoreFiles) != 1 || got.MoreFiles[0].FileName != "y.pdf" {
+		t.Fatalf("got %q + %+v, want x.pdf + y.pdf only", got.FileName, got.MoreFiles)
+	}
+}
+
+func TestAttachment_OneFileHasNoFurtherFiles(t *testing.T) {
+	store, id, tenantID := newStore(t)
+	if err := store.SaveAttachment(context.Background(), id, notifications.AttachmentInput{FileName: "SO-1.pdf", Content: []byte("%PDF")}); err != nil {
+		t.Fatalf("SaveAttachment: %v", err)
+	}
+	got, err := store.GetAttachment(context.Background(), tenantID, id)
+	if err != nil || got == nil {
+		t.Fatalf("GetAttachment = %v, %v", got, err)
+	}
+	if len(got.MoreFiles) != 0 {
+		t.Fatalf("a single-file notification must have no further files, got %+v", got.MoreFiles)
+	}
+}

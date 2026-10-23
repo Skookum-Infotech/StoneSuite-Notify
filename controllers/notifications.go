@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/mail"
@@ -242,9 +243,9 @@ type createNotificationRequest struct {
 	// channels.SendNotificationEmail.
 	EmailBodyHTML string `json:"emailBodyHtml,omitempty"`
 	// Attachments matches StoneSuite-Backend's services.NotificationRequest
-	// wire shape (a plural array under "attachments") — only the first entry
-	// is used, since a notification carries at most one file today
-	// (notification_attachments is one row per notification_id).
+	// wire shape (a plural array under "attachments"): every entry is attached,
+	// in order, up to maxEmailAttachments files and maxEmailAttachmentBytes in
+	// total once decoded.
 	Attachments []attachmentInput `json:"attachments,omitempty"`
 	// Per-message email header overrides — see notifications.EmailOptions.
 	// EmailReplyTo routes the customer's reply to a specific record's
@@ -300,6 +301,15 @@ const (
 	maxStatusResourceChars = 64
 )
 
+// Bounds on the files of one email. The size is a sanity bound well under
+// Resend's 40 MB per email after Base64 (about 30 MB of files), not a product
+// limit: StoneSuite-Backend enforces the 5 MB a staff reply may carry, and a
+// rendered document PDF has never been capped here.
+const (
+	maxEmailAttachments     = 5
+	maxEmailAttachmentBytes = 25 << 20
+)
+
 // Bounds on the per-message email header overrides. References can carry a
 // whole thread's Message-IDs, so it gets the most room.
 const (
@@ -345,16 +355,28 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	var attachment *notifications.AttachmentInput
 	if len(req.Attachments) > 0 || req.EmailBodyHTML != "" || !emailOpts.IsZero() {
 		attachment = &notifications.AttachmentInput{EmailBodyHTML: req.EmailBodyHTML, EmailOptions: emailOpts}
-		if len(req.Attachments) > 0 {
-			a := req.Attachments[0]
+		if len(req.Attachments) > maxEmailAttachments {
+			fail(w, http.StatusBadRequest, fmt.Sprintf("attachments must have at most %d files.", maxEmailAttachments))
+			return
+		}
+		var total int
+		for i, a := range req.Attachments {
 			content, decErr := base64.StdEncoding.DecodeString(a.ContentBase64)
 			if decErr != nil {
-				fail(w, http.StatusBadRequest, "attachments[0].contentBase64 is not valid base64.")
+				fail(w, http.StatusBadRequest, fmt.Sprintf("attachments[%d].contentBase64 is not valid base64.", i))
 				return
 			}
-			attachment.FileName = a.FileName
-			attachment.ContentType = a.ContentType
-			attachment.Content = content
+			if total += len(content); total > maxEmailAttachmentBytes {
+				fail(w, http.StatusBadRequest, fmt.Sprintf("attachments must total at most %d MB.", maxEmailAttachmentBytes>>20))
+				return
+			}
+			if i == 0 {
+				attachment.FileName, attachment.ContentType, attachment.Content = a.FileName, a.ContentType, content
+				continue
+			}
+			attachment.MoreFiles = append(attachment.MoreFiles, notifications.AttachmentFile{
+				FileName: a.FileName, ContentType: a.ContentType, Content: content,
+			})
 		}
 	}
 

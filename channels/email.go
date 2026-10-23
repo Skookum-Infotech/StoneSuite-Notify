@@ -24,15 +24,18 @@ import (
 	"stonesuite-notify/config"
 )
 
-const emailTimeout = 10 * time.Second
+// emailTimeout bounds one call to the email provider. A message can carry several
+// files (about 7 MB once encoded), and a timeout after the provider has accepted
+// the mail would send it twice on retry, so this leaves room for the upload.
+const emailTimeout = 30 * time.Second
 
 // resendEndpoint is Resend's send-email API. A package var, not a const, so
 // tests can point it at an httptest server.
 var resendEndpoint = "https://api.resend.com/emails"
 
-// EmailAttachment is the single file this channel can attach to a
-// notification email — currently only ever the PDF from a "document sent"
-// event. Defined here (not imported from notifications) so this package
+// EmailAttachment is one file attached to a notification email: the PDF of a
+// "document sent" event, or the files staff attach to a Communication-tab
+// reply. Defined here (not imported from notifications) so this package
 // stays dependency-free of the domain layer, matching its existing
 // config-only import list.
 type EmailAttachment struct {
@@ -105,8 +108,9 @@ func sanitizeHeader(v string) string {
 // EMAIL_FROM returns an error (the delivery then retries and goes
 // terminal with a reason) rather than a silent no-op, since a delivery
 // row only reaches this function when email was actually requested.
-// attachment is optional (nil for the overwhelming majority of
-// notifications). When emailBodyHTML is non-empty, it is used verbatim as
+// attachments is optional (none for the overwhelming majority of
+// notifications) and goes out in the order given. When emailBodyHTML is
+// non-empty, it is used verbatim as
 // the message body instead of the generic <h2>title</h2><p>body</p>
 // template — used by callers (e.g. a document-send customer email) that
 // need their own branding. Errors are returned for the worker to log and
@@ -114,7 +118,7 @@ func sanitizeHeader(v string) string {
 // It returns the provider's id for the sent email (Resend only; "" for SMTP),
 // which the worker stores so the provider's delivery webhooks can be matched
 // to this delivery.
-func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHTML string, attachment *EmailAttachment, opts EmailOptions) (string, error) {
+func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHTML string, attachments []EmailAttachment, opts EmailOptions) (string, error) {
 	if to == "" {
 		return "", fmt.Errorf("email channel: recipient address is empty")
 	}
@@ -141,9 +145,9 @@ func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHT
 
 	switch {
 	case cfg.ResendAPIKey != "":
-		return sendViaResend(cfg, to, title, htmlBody, textBody, attachment, opts)
+		return sendViaResend(cfg, to, title, htmlBody, textBody, attachments, opts)
 	case cfg.SMTPHost != "":
-		return "", sendViaSMTP(cfg, to, title, htmlBody, textBody, attachment, opts)
+		return "", sendViaSMTP(cfg, to, title, htmlBody, textBody, attachments, opts)
 	default:
 		// A delivery row only reaches this worker because Create decided
 		// email was wanted and enabled — so "no provider" here is a
@@ -195,8 +199,9 @@ func htmlToPlainText(h string) string {
 }
 
 type resendAttachment struct {
-	Filename string `json:"filename"`
-	Content  string `json:"content"`
+	Filename    string `json:"filename"`
+	Content     string `json:"content"`
+	ContentType string `json:"content_type,omitempty"`
 }
 
 type resendRequest struct {
@@ -217,7 +222,7 @@ type resendResponse struct {
 
 // sendViaResend sends through Resend and returns Resend's id for the accepted
 // email ("" if the response carried none).
-func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, attachment *EmailAttachment, opts EmailOptions) (string, error) {
+func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, attachments []EmailAttachment, opts EmailOptions) (string, error) {
 	req := resendRequest{
 		From:    opts.from(cfg),
 		To:      to,
@@ -227,11 +232,12 @@ func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, at
 		HTML:    htmlBody,
 		Text:    textBody,
 	}
-	if attachment != nil {
-		req.Attachments = []resendAttachment{{
-			Filename: attachment.FileName,
-			Content:  base64.StdEncoding.EncodeToString(attachment.Content),
-		}}
+	for _, a := range attachments {
+		req.Attachments = append(req.Attachments, resendAttachment{
+			Filename:    a.FileName,
+			Content:     base64.StdEncoding.EncodeToString(a.Content),
+			ContentType: a.ContentType,
+		})
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -270,9 +276,9 @@ func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, at
 	return accepted.ID, nil
 }
 
-func sendViaSMTP(cfg config.Config, to, subject, htmlBody, textBody string, attachment *EmailAttachment, opts EmailOptions) error {
+func sendViaSMTP(cfg config.Config, to, subject, htmlBody, textBody string, attachments []EmailAttachment, opts EmailOptions) error {
 	addr := cfg.SMTPHost + ":" + cfg.SMTPPort
-	msg := buildSMTPMessage(to, opts.from(cfg), opts.replyTo(cfg), subject, htmlBody, textBody, attachment, opts)
+	msg := buildSMTPMessage(to, opts.from(cfg), opts.replyTo(cfg), subject, htmlBody, textBody, attachments, opts)
 
 	var auth smtp.Auth
 	if cfg.SMTPUsername != "" {
@@ -312,10 +318,11 @@ func mimeBody(htmlBody, altText string) (contentType string, body []byte) {
 
 // buildSMTPMessage assembles the raw RFC 5322 message. The body is a
 // text/html part, or a multipart/alternative (text/plain then text/html) when
-// a plain-text alternative is supplied; an attachment wraps that body in an
-// outer multipart/mixed. Mirrors the html/text/reply_to shape Resend builds,
-// so both providers deliver the same message.
-func buildSMTPMessage(to, from, replyTo, subject, htmlBody, textBody string, attachment *EmailAttachment, opts EmailOptions) []byte {
+// a plain-text alternative is supplied; attachments wrap that body in an
+// outer multipart/mixed, one part each in the order given. Mirrors the
+// html/text/reply_to shape Resend builds, so both providers deliver the same
+// message.
+func buildSMTPMessage(to, from, replyTo, subject, htmlBody, textBody string, attachments []EmailAttachment, opts EmailOptions) []byte {
 	bodyCT, bodyBytes := mimeBody(htmlBody, textBody)
 
 	var buf bytes.Buffer
@@ -338,7 +345,7 @@ func buildSMTPMessage(to, from, replyTo, subject, htmlBody, textBody string, att
 	buf.WriteString("Subject: " + subject + "\r\n")
 	buf.WriteString("MIME-Version: 1.0\r\n")
 
-	if attachment == nil {
+	if len(attachments) == 0 {
 		buf.WriteString("Content-Type: " + bodyCT + "\r\n\r\n")
 		buf.Write(bodyBytes)
 		buf.WriteString("\r\n")
@@ -354,24 +361,34 @@ func buildSMTPMessage(to, from, replyTo, subject, htmlBody, textBody string, att
 		_, _ = pw.Write(bodyBytes)
 	}
 
-	ct := attachment.ContentType
-	if ct == "" {
-		ct = "application/octet-stream"
-	}
-	attHdr := textproto.MIMEHeader{}
-	attHdr.Set("Content-Type", ct)
-	attHdr.Set("Content-Transfer-Encoding", "base64")
-	attHdr.Set("Content-Disposition", `attachment; filename="`+attachment.FileName+`"`)
-	if pw, err := mw.CreatePart(attHdr); err == nil {
-		b64 := base64.StdEncoding.EncodeToString(attachment.Content)
-		for i := 0; i < len(b64); i += 76 {
-			end := i + 76
-			if end > len(b64) {
-				end = len(b64)
+	for _, attachment := range attachments {
+		ct := sanitizeHeader(attachment.ContentType)
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		attHdr := textproto.MIMEHeader{}
+		attHdr.Set("Content-Type", ct)
+		attHdr.Set("Content-Transfer-Encoding", "base64")
+		attHdr.Set("Content-Disposition", `attachment; filename="`+quotedFileName(attachment.FileName)+`"`)
+		if pw, err := mw.CreatePart(attHdr); err == nil {
+			b64 := base64.StdEncoding.EncodeToString(attachment.Content)
+			for i := 0; i < len(b64); i += 76 {
+				end := i + 76
+				if end > len(b64) {
+					end = len(b64)
+				}
+				pw.Write([]byte(b64[i:end] + "\r\n"))
 			}
-			pw.Write([]byte(b64[i:end] + "\r\n"))
 		}
 	}
 	_ = mw.Close()
 	return buf.Bytes()
+}
+
+// quotedFileName makes a file name safe inside a quoted Content-Disposition
+// parameter: no CR/LF (header injection) and no quote or backslash that would end
+// or escape the quoted string. File names now come from staff uploads, not only
+// from a rendered PDF, so they are not trusted.
+func quotedFileName(name string) string {
+	return strings.NewReplacer("\r", "", "\n", "", `"`, "'", `\`, "_").Replace(name)
 }

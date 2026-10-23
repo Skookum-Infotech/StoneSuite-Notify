@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1122,6 +1123,93 @@ func TestHandler_Create_InternalRecipient_NotBlockedByUnsendableEmail(t *testing
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// attachmentsBody builds a create request carrying the given base64 files.
+func attachmentsBody(files ...string) string {
+	entries := make([]string, 0, len(files))
+	for i, b64 := range files {
+		entries = append(entries, `{"fileName": "f`+strconv.Itoa(i)+`.pdf", "contentType": "application/pdf", "contentBase64": "`+b64+`"}`)
+	}
+	return `{
+		"tenantId": "t1",
+		"recipients": [{"userId": "u1", "email": "u1@example.com"}],
+		"eventType": "record.email_reply",
+		"resource": "quote",
+		"resourceId": "q-1",
+		"title": "Re: Your quote",
+		"channels": ["email"],
+		"attachments": [` + strings.Join(entries, ",") + `]
+	}`
+}
+
+func postRawCreate(h *Handler, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/api/notifications/internal", bytes.NewReader([]byte(body)))
+	rec := httptest.NewRecorder()
+	h.Create(rec, req)
+	return rec
+}
+
+func TestHandler_Create_WithSeveralAttachments_SavesAllInOrder(t *testing.T) {
+	store := &fakeStore{}
+	h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
+
+	// "one", "two", "three"
+	rec := postRawCreate(h, attachmentsBody("b25l", "dHdv", "dGhyZWU="))
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(store.savedAttachments) != 1 {
+		t.Fatalf("expected one attachment row for the notification, got %d", len(store.savedAttachments))
+	}
+	for _, a := range store.savedAttachments {
+		if a.FileName != "f0.pdf" || string(a.Content) != "one" {
+			t.Errorf("first file = %q %q, want f0.pdf one", a.FileName, a.Content)
+		}
+		if len(a.MoreFiles) != 2 {
+			t.Fatalf("further files = %d, want 2", len(a.MoreFiles))
+		}
+		if a.MoreFiles[0].FileName != "f1.pdf" || string(a.MoreFiles[0].Content) != "two" {
+			t.Errorf("second file = %+v", a.MoreFiles[0])
+		}
+		if a.MoreFiles[1].FileName != "f2.pdf" || string(a.MoreFiles[1].Content) != "three" || a.MoreFiles[1].ContentType != "application/pdf" {
+			t.Errorf("third file = %+v", a.MoreFiles[1])
+		}
+	}
+}
+
+func TestHandler_Create_AttachmentLimits(t *testing.T) {
+	big := strings.Repeat("A", 7_200_000) // 5.4 MB decoded; five of them pass the count but not the size
+	tests := []struct {
+		name     string
+		body     string
+		wantCode int
+		wantMsg  string
+	}{
+		{"exactly the file count limit", attachmentsBody("b25l", "b25l", "b25l", "b25l", "b25l"), http.StatusCreated, ""},
+		{"one file too many", attachmentsBody("b25l", "b25l", "b25l", "b25l", "b25l", "b25l"), http.StatusBadRequest, "at most 5 files"},
+		{"too large in total", attachmentsBody(big, big, big, big, big), http.StatusBadRequest, "at most 25 MB"},
+		{"the second file is not base64", attachmentsBody("b25l", "not base64!"), http.StatusBadRequest, "attachments[1]"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeStore{}
+			h := newTestHandler(store, newFakePreferencesStore(), &fakeDeliveriesStore{}, config.Config{})
+
+			rec := postRawCreate(h, tc.body)
+
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d: %.200s", rec.Code, tc.wantCode, rec.Body.String())
+			}
+			if tc.wantMsg != "" && !strings.Contains(rec.Body.String(), tc.wantMsg) {
+				t.Fatalf("body %q does not mention %q", rec.Body.String(), tc.wantMsg)
+			}
+			if tc.wantCode != http.StatusCreated && len(store.savedAttachments) != 0 {
+				t.Fatalf("a refused request saved %d attachments", len(store.savedAttachments))
+			}
+		})
 	}
 }
 
