@@ -39,10 +39,10 @@ type Store interface {
 	// so resource-restricted rows are never marked read without the
 	// recipient having actually been able to see them.
 	MarkAllRead(ctx context.Context, tenantID, recipientUserID string, allowedResources []string) error
-	// SaveAttachment persists the single attachment for a notification's
-	// email delivery. Called at most once per notification, from
-	// controllers.Handler.Create, only when email delivery was actually
-	// requested for that recipient.
+	// SaveAttachment persists the attachments (files, custom body, header
+	// options) for a notification's email delivery. Called at most once per
+	// notification, from controllers.Handler.Create, only when email delivery
+	// was actually requested for that recipient.
 	SaveAttachment(ctx context.Context, notificationID string, a AttachmentInput) error
 	// GetAttachment loads a notification's attachment, if any. Returns
 	// (nil, nil) — not an error — when the notification has none, since
@@ -247,9 +247,11 @@ func (s *PGStore) MarkAllRead(ctx context.Context, tenantID, recipientUserID str
 }
 
 // SaveAttachment inserts (or replaces, on the rare case of a retry)
-// notification_id's attachment row. content defaults to an empty (not
-// NULL) byte slice when only a.EmailBodyHTML is set and there is no actual
-// file, since the column is NOT NULL.
+// notification_id's attachment row, and its further files, in one
+// transaction. content defaults to an empty (not NULL) byte slice when only
+// a.EmailBodyHTML is set and there is no actual file, since the column is NOT
+// NULL. A replace drops the files of the earlier save, so a retry never mixes
+// two sets.
 func (s *PGStore) SaveAttachment(ctx context.Context, notificationID string, a AttachmentInput) error {
 	content := a.Content
 	if content == nil {
@@ -259,7 +261,14 @@ func (s *PGStore) SaveAttachment(ctx context.Context, notificationID string, a A
 	if err != nil {
 		return fmt.Errorf("encode email options for notification %s: %w", notificationID, err)
 	}
-	_, err = s.pool.Exec(ctx, `
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin save of notification attachment %s: %w", notificationID, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO notification_attachments (notification_id, file_name, content_type, content, email_body_html, email_options)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (notification_id) DO UPDATE
@@ -268,9 +277,26 @@ func (s *PGStore) SaveAttachment(ctx context.Context, notificationID string, a A
 			    content = EXCLUDED.content,
 			    email_body_html = EXCLUDED.email_body_html,
 			    email_options = EXCLUDED.email_options`,
-		notificationID, a.FileName, a.ContentType, content, a.EmailBodyHTML, options)
-	if err != nil {
+		notificationID, a.FileName, a.ContentType, content, a.EmailBodyHTML, options); err != nil {
 		return fmt.Errorf("save notification attachment %s: %w", notificationID, err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM notification_attachment_files WHERE notification_id = $1`, notificationID); err != nil {
+		return fmt.Errorf("clear further files of notification %s: %w", notificationID, err)
+	}
+	for i, f := range a.MoreFiles {
+		fileContent := f.Content
+		if fileContent == nil {
+			fileContent = []byte{}
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO notification_attachment_files (notification_id, position, file_name, content_type, content)
+			VALUES ($1, $2, $3, $4, $5)`,
+			notificationID, i, f.FileName, f.ContentType, fileContent); err != nil {
+			return fmt.Errorf("save file %d of notification %s: %w", i+2, notificationID, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit notification attachment %s: %w", notificationID, err)
 	}
 	return nil
 }
@@ -299,6 +325,24 @@ func (s *PGStore) GetAttachment(ctx context.Context, tenantID, notificationID st
 		if err := json.Unmarshal(options, &a.EmailOptions); err != nil {
 			return nil, fmt.Errorf("decode email options for notification %s: %w", notificationID, err)
 		}
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT file_name, content_type, content FROM notification_attachment_files
+		WHERE notification_id = $1 ORDER BY position`, notificationID)
+	if err != nil {
+		return nil, fmt.Errorf("get further files of notification %s: %w", notificationID, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var f AttachmentFile
+		if err := rows.Scan(&f.FileName, &f.ContentType, &f.Content); err != nil {
+			return nil, fmt.Errorf("scan further file of notification %s: %w", notificationID, err)
+		}
+		a.MoreFiles = append(a.MoreFiles, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate further files of notification %s: %w", notificationID, err)
 	}
 	return &a, nil
 }

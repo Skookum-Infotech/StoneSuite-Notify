@@ -30,7 +30,7 @@ type Deps struct {
 	PushSubs      pushsubs.Store
 	Audit         audit.Recorder
 	Config        config.Config
-	SendEmail     func(cfg config.Config, to, title, body, link, emailBodyHTML string, attachment *channels.EmailAttachment, opts channels.EmailOptions) (string, error)
+	SendEmail     func(cfg config.Config, to, title, body, link, emailBodyHTML string, attachments []channels.EmailAttachment, opts channels.EmailOptions) (string, error)
 	SendPush      func(cfg config.Config, sub channels.PushSubscription, title, body, link string) (stale bool, err error)
 }
 
@@ -106,7 +106,7 @@ func attemptDelivery(ctx context.Context, deps Deps, d deliveries.Delivery) {
 }
 
 func attemptEmail(ctx context.Context, deps Deps, d deliveries.Delivery, n notifications.Notification) {
-	var attachment *channels.EmailAttachment
+	var attachments []channels.EmailAttachment
 	var emailBodyHTML string
 	var emailOpts channels.EmailOptions
 	att, err := deps.Notifications.GetAttachment(ctx, n.TenantID, n.ID)
@@ -121,11 +121,14 @@ func attemptEmail(ctx context.Context, deps Deps, d deliveries.Delivery, n notif
 			References: att.EmailOptions.References,
 		}
 		if att.FileName != "" {
-			attachment = &channels.EmailAttachment{FileName: att.FileName, ContentType: att.ContentType, Content: att.Content}
+			attachments = append(attachments, channels.EmailAttachment{FileName: att.FileName, ContentType: att.ContentType, Content: att.Content})
+		}
+		for _, f := range att.MoreFiles {
+			attachments = append(attachments, channels.EmailAttachment{FileName: f.FileName, ContentType: f.ContentType, Content: f.Content})
 		}
 	}
 
-	providerID, err := deps.SendEmail(deps.Config, n.RecipientEmail, n.Title, n.Body, n.Link, emailBodyHTML, attachment, emailOpts)
+	providerID, err := deps.SendEmail(deps.Config, n.RecipientEmail, n.Title, n.Body, n.Link, emailBodyHTML, attachments, emailOpts)
 	if err != nil {
 		log.Printf("workers: email delivery %s: %v", d.ID, err)
 		markFailedAttempt(ctx, deps, d, err.Error(), nil)

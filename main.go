@@ -89,12 +89,20 @@ func main() {
 	emailEventsHandler := controllers.NewEmailEventsHandler(emailEventsStore, cfg.ResendWebhookSecret)
 	if cfg.InboundConfigured() {
 		// A customer's reply, received by Resend, is fetched here and forwarded to
-		// the backend signed with the secret both services already share.
+		// the backend signed with the secret both services already share. The files
+		// that came with it are queued, then copied one by one by a worker: the
+		// webhook cannot wait for them.
+		resend := inbound.ResendFetcher{APIKey: cfg.ResendAPIKey}
+		forwarder := inbound.HTTPForwarder{BackendURL: cfg.BackendURL, Secret: cfg.InternalServiceSecret}
+		jobStore := inbound.NewPGJobStore(pool)
 		emailEventsHandler.WithInbound(inbound.Processor{
 			Domain:    cfg.ReplyEmailDomain,
-			Fetcher:   inbound.ResendFetcher{APIKey: cfg.ResendAPIKey},
-			Forwarder: inbound.HTTPForwarder{BackendURL: cfg.BackendURL, Secret: cfg.InternalServiceSecret},
+			Fetcher:   resend,
+			Forwarder: forwarder,
+			Lister:    resend,
+			Jobs:      jobStore,
 		})
+		go workers.InboundAttachmentWorker{Jobs: jobStore, Lister: resend, Downloader: resend, Uploader: forwarder}.Run(ctx)
 	}
 
 	workerDeps := workers.NewDeps(store, deliveryStore, pushStore, auditRecorder, cfg)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -73,7 +74,7 @@ func TestBuildMail(t *testing.T) {
 			From: "Priya <priya@gmail.com>", To: []string{"r-x@reply.example.com"}, Cc: []string{"cc@x.com"},
 			Subject: "Re: fetched", Text: "hello", HTML: "<p>hello</p>", MessageID: "<fetched@x>",
 			Headers: map[string]any{"In-Reply-To": " <sent@resend> ", "REFERENCES": "<sent@resend>"},
-		})
+		}, nil)
 		if m.EmailID != "em_123" || m.From != "Priya <priya@gmail.com>" || m.Subject != "Re: fetched" || m.MessageID != "<fetched@x>" {
 			t.Fatalf("fetched values not preferred: %+v", m)
 		}
@@ -89,7 +90,7 @@ func TestBuildMail(t *testing.T) {
 	})
 
 	t.Run("webhook metadata fills what the fetched copy lacks", func(t *testing.T) {
-		m := BuildMail(ev, Received{Text: "x"})
+		m := BuildMail(ev, Received{Text: "x"}, nil)
 		if m.From != "Priya Shah <priya@gmail.com>" || m.Subject != "Re: Your Sales Order SO-1" || m.MessageID != "<CAF+abc@mail.gmail.com>" {
 			t.Fatalf("fallbacks wrong: %+v", m)
 		}
@@ -99,7 +100,7 @@ func TestBuildMail(t *testing.T) {
 	})
 
 	t.Run("bcc comes only from the webhook", func(t *testing.T) {
-		m := BuildMail(ev, Received{Text: "x"})
+		m := BuildMail(ev, Received{Text: "x"}, nil)
 		if len(m.BCC) != 1 || m.BCC[0] != "audit@reply.example.com" {
 			t.Fatalf("BCC = %v", m.BCC)
 		}
@@ -107,11 +108,136 @@ func TestBuildMail(t *testing.T) {
 
 	t.Run("oversized parts are cut on a character boundary", func(t *testing.T) {
 		long := strings.Repeat("é", maxBodyBytes) // 2 bytes each
-		m := BuildMail(ev, Received{Text: long, HTML: long})
+		m := BuildMail(ev, Received{Text: long, HTML: long}, nil)
 		for name, got := range map[string]string{"text": m.Text, "html": m.HTML} {
 			if len(got) > maxBodyBytes || !utf8.ValidString(got) {
 				t.Errorf("%s: %d bytes, valid=%v; want <= %d and valid UTF-8", name, len(got), utf8.ValidString(got), maxBodyBytes)
 			}
+		}
+	})
+}
+
+func TestBuildMail_ListedFilesBecomeAttachmentMetadata(t *testing.T) {
+	ev, _ := ParseEvent([]byte(sampleEvent))
+	files := []ReceivedAttachment{
+		{ID: "att_1", Filename: "photo.jpg", Size: 4096, ContentType: "image/jpeg", ContentDisposition: "attachment", DownloadURL: "https://inbound-cdn.resend.com/x"},
+		{ID: "att_2", Filename: "logo.png", Size: 300, ContentType: "image/png", ContentDisposition: "INLINE", ContentID: "img001"},
+	}
+
+	m := BuildMail(ev, Received{Text: "x"}, files)
+
+	if len(m.Attachments) != 2 {
+		t.Fatalf("attachments = %+v, want 2", m.Attachments)
+	}
+	if a := m.Attachments[0]; a.ID != "att_1" || a.Filename != "photo.jpg" || a.ContentType != "image/jpeg" || a.Size != 4096 || a.Inline {
+		t.Errorf("first = %+v", a)
+	}
+	if a := m.Attachments[1]; !a.Inline {
+		t.Errorf("a file with disposition INLINE must be flagged inline: %+v", a)
+	}
+	if m.AttachmentCount != 1 {
+		t.Errorf("AttachmentCount = %d, want the webhook's 1 (it still comes from the webhook)", m.AttachmentCount)
+	}
+
+	if got := BuildMail(ev, Received{Text: "x"}, nil).Attachments; len(got) != 0 {
+		t.Errorf("no listed files means no attachment metadata, got %+v", got)
+	}
+}
+
+func TestProcessor_CopiesFiles(t *testing.T) {
+	ev, _ := ParseEvent([]byte(sampleEvent))
+	listed := []ReceivedAttachment{{ID: "att_1", Filename: "photo.jpg", Size: 10, ContentType: "image/jpeg"}}
+	proc := func(f *fakeFetcher, l *fakeLister, fw *fakeForwarder, jobs *fakeJobs) Processor {
+		p := Processor{Domain: "reply.example.com", Fetcher: f, Forwarder: fw}
+		if l != nil {
+			p.Lister = l
+		}
+		if jobs != nil {
+			p.Jobs = jobs
+		}
+		return p
+	}
+
+	t.Run("lists the files, forwards their metadata and queues what the backend wants", func(t *testing.T) {
+		f, l, jobs := &fakeFetcher{mail: Received{Text: "see attached"}}, &fakeLister{files: listed}, &fakeJobs{}
+		fw := &fakeForwarder{result: ForwardResult{UploadRef: "r-abcdefghijklmnopqrst", Pending: []string{"att_1"}}}
+
+		out, err := proc(f, l, fw, jobs).Process(context.Background(), ev)
+
+		if err != nil || out != OutcomeForwarded {
+			t.Fatalf("Process = %v, %v", out, err)
+		}
+		if l.calls != 1 || len(fw.got.Attachments) != 1 || fw.got.Attachments[0].ID != "att_1" {
+			t.Fatalf("listed %d times, forwarded %+v", l.calls, fw.got.Attachments)
+		}
+		if len(jobs.queued) != 1 || jobs.queued[0].emailID != "em_123" || jobs.queued[0].ref != "r-abcdefghijklmnopqrst" ||
+			len(jobs.queued[0].ids) != 1 || jobs.queued[0].ids[0] != "att_1" {
+			t.Fatalf("queued = %+v", jobs.queued)
+		}
+	})
+
+	t.Run("queues nothing when the backend wants nothing", func(t *testing.T) {
+		jobs := &fakeJobs{}
+		fw := &fakeForwarder{result: ForwardResult{UploadRef: "r-x", Pending: []string{}}}
+
+		if _, err := proc(&fakeFetcher{}, &fakeLister{files: listed}, fw, jobs).Process(context.Background(), ev); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+		if len(jobs.queued) != 0 {
+			t.Fatalf("queued %+v, want nothing", jobs.queued)
+		}
+	})
+
+	t.Run("an older backend names no files, so nothing is queued", func(t *testing.T) {
+		jobs := &fakeJobs{}
+		if _, err := proc(&fakeFetcher{}, &fakeLister{files: listed}, &fakeForwarder{}, jobs).Process(context.Background(), ev); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+		if len(jobs.queued) != 0 {
+			t.Fatalf("queued %+v, want nothing", jobs.queued)
+		}
+	})
+
+	t.Run("without a job store the files are not listed and only the count is forwarded", func(t *testing.T) {
+		l, fw := &fakeLister{files: listed}, &fakeForwarder{}
+		if _, err := proc(&fakeFetcher{}, l, fw, nil).Process(context.Background(), ev); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+		if l.calls != 0 || len(fw.got.Attachments) != 0 || fw.got.AttachmentCount != 1 {
+			t.Fatalf("listed %d times, forwarded %+v (count %d)", l.calls, fw.got.Attachments, fw.got.AttachmentCount)
+		}
+	})
+
+	t.Run("a mail with no files is not listed", func(t *testing.T) {
+		noFiles := ev
+		noFiles.Data.Attachments = nil
+		l := &fakeLister{files: listed}
+
+		if _, err := proc(&fakeFetcher{}, l, &fakeForwarder{}, &fakeJobs{}).Process(context.Background(), noFiles); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+		if l.calls != 0 {
+			t.Fatalf("listed %d times for a mail with no files", l.calls)
+		}
+	})
+
+	t.Run("a failed listing stops before forwarding and keeps its retry mark", func(t *testing.T) {
+		l, fw := &fakeLister{err: &RetryableError{Err: errors.New("resend is down")}}, &fakeForwarder{}
+		_, err := proc(&fakeFetcher{}, l, fw, &fakeJobs{}).Process(context.Background(), ev)
+		if err == nil || !IsRetryable(err) || fw.calls != 0 {
+			t.Fatalf("err = %v retryable=%v, forwarded %d; want a retryable error and no forward", err, IsRetryable(err), fw.calls)
+		}
+	})
+
+	t.Run("a queue failure after the mail was filed asks for a retry", func(t *testing.T) {
+		jobs := &fakeJobs{err: errors.New("database is down")}
+		fw := &fakeForwarder{result: ForwardResult{UploadRef: "r-x", Pending: []string{"att_1"}}}
+		_, err := proc(&fakeFetcher{}, &fakeLister{files: listed}, fw, jobs).Process(context.Background(), ev)
+		if err == nil || !IsRetryable(err) {
+			t.Fatalf("err = %v retryable=%v; want a retryable error so Resend sends the webhook again", err, IsRetryable(err))
+		}
+		if fw.calls != 1 {
+			t.Fatalf("forwarded %d times, want 1 (the mail is filed before the queue is touched)", fw.calls)
 		}
 	})
 }
@@ -153,15 +279,61 @@ func (f *fakeFetcher) Fetch(_ context.Context, id string) (Received, error) {
 }
 
 type fakeForwarder struct {
-	err   error
-	calls int
-	got   Mail
+	err    error
+	result ForwardResult
+	calls  int
+	got    Mail
 }
 
-func (f *fakeForwarder) Forward(_ context.Context, m Mail) error {
+func (f *fakeForwarder) Forward(_ context.Context, m Mail) (ForwardResult, error) {
 	f.calls++
 	f.got = m
-	return f.err
+	return f.result, f.err
+}
+
+type fakeLister struct {
+	files []ReceivedAttachment
+	err   error
+	calls int
+}
+
+func (f *fakeLister) ListAttachments(context.Context, string) ([]ReceivedAttachment, error) {
+	f.calls++
+	return f.files, f.err
+}
+
+type queuedJobs struct {
+	emailID, ref string
+	ids          []string
+}
+
+type fakeJobs struct {
+	queued []queuedJobs
+	err    error
+}
+
+func (f *fakeJobs) Enqueue(_ context.Context, emailID, ref string, ids []string) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.queued = append(f.queued, queuedJobs{emailID: emailID, ref: ref, ids: ids})
+	return nil
+}
+
+func (f *fakeJobs) ClaimDue(context.Context, int, time.Duration) ([]Job, error) {
+	return nil, nil
+}
+
+func (f *fakeJobs) Complete(context.Context, string) error {
+	return nil
+}
+
+func (f *fakeJobs) Retry(context.Context, string, int, string) error {
+	return nil
+}
+
+func (f *fakeJobs) Fail(context.Context, string, string) error {
+	return nil
 }
 
 func TestProcessor_Process(t *testing.T) {

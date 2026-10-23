@@ -57,16 +57,28 @@ type CreateInput struct {
 }
 
 // AttachmentInput is the optional per-notification content only the email
-// delivery worker reads: an attached file, custom HTML to use in place of
-// the generic template, or both. Persisted in notification_attachments, not
-// on the notification row itself — see that table's doc comment in
-// schema.sql.
+// delivery worker reads: attached files, custom HTML to use in place of
+// the generic template, or both. Persisted in notification_attachments (the
+// first file and the rest of this) and notification_attachment_files (the
+// other files), not on the notification row itself — see those tables' doc
+// comments in schema.sql.
 type AttachmentInput struct {
-	FileName      string
-	ContentType   string
-	Content       []byte
+	// FileName, ContentType and Content are the first attached file; empty when
+	// the notification carries no file.
+	FileName    string
+	ContentType string
+	Content     []byte
+	// MoreFiles are the files after the first, in the order they are sent.
+	MoreFiles     []AttachmentFile
 	EmailBodyHTML string
 	EmailOptions  EmailOptions
+}
+
+// AttachmentFile is one attached file beyond the first.
+type AttachmentFile struct {
+	FileName    string
+	ContentType string
+	Content     []byte
 }
 
 // EmailOptions are the per-message header overrides persisted with the

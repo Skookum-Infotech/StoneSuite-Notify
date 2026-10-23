@@ -16,6 +16,11 @@ import (
 	"unicode/utf8"
 )
 
+// MaxFileBytes is the largest received file that is copied to the backend. It
+// matches the backend's own limit (recordemail.InboundMaxFileBytes): a bigger file
+// is recorded there as too large and never asked for.
+const MaxFileBytes = 20 << 20
+
 const (
 	// EventEmailReceived is the Resend webhook event for an inbound mail.
 	EventEmailReceived = "email.received"
@@ -45,7 +50,9 @@ type EventData struct {
 	Attachments []Attachment `json:"attachments"`
 }
 
-// Attachment is the metadata of one attached file; only the count is forwarded.
+// Attachment is the webhook's metadata of one attached file: just an id and a
+// name. The size, type and whether it is inline come from the attachments API
+// (see ReceivedAttachment).
 type Attachment struct {
 	ID       string `json:"id"`
 	Filename string `json:"filename"`
@@ -110,11 +117,49 @@ type Mail struct {
 	Text            string   `json:"text"`
 	HTML            string   `json:"html"`
 	AttachmentCount int      `json:"attachmentCount"`
+	// Attachments describes each attached file, so the backend can record them and
+	// say which ones it wants copied. Empty when files cannot be copied (no job
+	// store), which leaves only the count above, as before.
+	Attachments []MailAttachment `json:"attachments"`
 }
 
-// BuildMail merges the webhook event and the fetched mail into the payload the
-// backend receives. The fetched copy wins; the webhook fills any gap.
-func BuildMail(ev Event, rec Received) Mail {
+// MailAttachment is one file's metadata in the forwarded mail.
+type MailAttachment struct {
+	ID          string `json:"id"`
+	Filename    string `json:"filename"`
+	ContentType string `json:"contentType"`
+	Size        int64  `json:"size"`
+	Inline      bool   `json:"inline"`
+}
+
+// ReceivedAttachment is one file of a received mail as Resend's attachments API
+// lists it. DownloadURL is a time-limited link (about an hour), so it is fetched
+// fresh for every attempt to copy the file, never stored.
+type ReceivedAttachment struct {
+	ID                 string `json:"id"`
+	Filename           string `json:"filename"`
+	Size               int64  `json:"size"`
+	ContentType        string `json:"content_type"`
+	ContentDisposition string `json:"content_disposition"`
+	ContentID          string `json:"content_id"`
+	DownloadURL        string `json:"download_url"`
+	ExpiresAt          string `json:"expires_at"`
+}
+
+// IsInline reports whether the file is shown inside the mail body (a pasted
+// picture, a signature logo) rather than attached to it.
+func (a ReceivedAttachment) IsInline() bool { return strings.EqualFold(a.ContentDisposition, "inline") }
+
+// BuildMail merges the webhook event, the fetched mail and the listed files into
+// the payload the backend receives. The fetched copy wins; the webhook fills any
+// gap. files is nil when the files were not listed.
+func BuildMail(ev Event, rec Received, files []ReceivedAttachment) Mail {
+	var attachments []MailAttachment
+	for _, f := range files {
+		attachments = append(attachments, MailAttachment{
+			ID: f.ID, Filename: f.Filename, ContentType: f.ContentType, Size: f.Size, Inline: f.IsInline(),
+		})
+	}
 	return Mail{
 		EmailID:         ev.Data.EmailID,
 		From:            firstNonEmpty(rec.From, ev.Data.From),
@@ -128,6 +173,7 @@ func BuildMail(ev Event, rec Received) Mail {
 		Text:            truncateBytes(rec.Text, maxBodyBytes),
 		HTML:            truncateBytes(rec.HTML, maxBodyBytes),
 		AttachmentCount: len(ev.Data.Attachments),
+		Attachments:     attachments,
 	}
 }
 
@@ -152,9 +198,35 @@ type Fetcher interface {
 	Fetch(ctx context.Context, emailID string) (Received, error)
 }
 
+// ForwardResult is what the backend answers to a forwarded mail: the files it
+// still wants copied (Pending, the provider's attachment ids) and the UploadRef to
+// send them under. Both are empty when there is nothing to copy, and always are
+// for a backend that does not copy files.
+type ForwardResult struct {
+	UploadRef string   `json:"uploadRef"`
+	Pending   []string `json:"pending"`
+}
+
 // Forwarder hands a received mail to the backend.
 type Forwarder interface {
-	Forward(ctx context.Context, m Mail) error
+	Forward(ctx context.Context, m Mail) (ForwardResult, error)
+}
+
+// AttachmentLister lists a received mail's files, with fresh download links.
+type AttachmentLister interface {
+	ListAttachments(ctx context.Context, emailID string) ([]ReceivedAttachment, error)
+}
+
+// FileDownloader fetches one received file's bytes from its download link,
+// refusing one larger than maxBytes (ErrFileTooLarge).
+type FileDownloader interface {
+	Download(ctx context.Context, downloadURL string, maxBytes int64) ([]byte, error)
+}
+
+// FileUploader hands one received file to the backend, under the UploadRef its
+// answer to the forwarded mail named.
+type FileUploader interface {
+	UploadAttachment(ctx context.Context, ref, attachmentID, contentType string, data []byte) error
 }
 
 // Outcome says what Process did with an event.
@@ -167,18 +239,27 @@ const (
 	OutcomeForwarded Outcome = "forwarded"
 )
 
-// Processor turns an email.received event into a forwarded mail.
+// Processor turns an email.received event into a forwarded mail, and queues the
+// copying of the files that came with it.
 type Processor struct {
 	// Domain is the reply domain (REPLY_EMAIL_DOMAIN): mail not addressed to it
 	// is ignored without being fetched.
 	Domain    string
 	Fetcher   Fetcher
 	Forwarder Forwarder
+	// Lister and Jobs enable copying files: both or neither. Without them a mail
+	// is forwarded with only its attachment count.
+	Lister AttachmentLister
+	Jobs   JobStore
 }
 
 // Process handles one event. A mail for another domain is ignored. Any error is
 // either a *RetryableError (a later attempt could succeed, so the webhook should
 // be answered with a failure and Resend will retry) or permanent.
+//
+// The files are not copied here: the webhook has only seconds to answer. The
+// backend records them and names the ones it wants; those are queued as jobs for
+// the worker, so a retried webhook only queues what is still wanted.
 func (p Processor) Process(ctx context.Context, ev Event) (Outcome, error) {
 	if ev.Data.EmailID == "" || !AddressedToDomain(ev.Recipients(), p.Domain) {
 		return OutcomeIgnored, nil
@@ -187,8 +268,23 @@ func (p Processor) Process(ctx context.Context, ev Event) (Outcome, error) {
 	if err != nil {
 		return "", fmt.Errorf("fetch received email: %w", err)
 	}
-	if err := p.Forwarder.Forward(ctx, BuildMail(ev, rec)); err != nil {
+
+	var files []ReceivedAttachment
+	if len(ev.Data.Attachments) > 0 && p.Lister != nil && p.Jobs != nil {
+		if files, err = p.Lister.ListAttachments(ctx, ev.Data.EmailID); err != nil {
+			return "", fmt.Errorf("list received attachments: %w", err)
+		}
+	}
+	res, err := p.Forwarder.Forward(ctx, BuildMail(ev, rec, files))
+	if err != nil {
 		return "", fmt.Errorf("forward received email: %w", err)
+	}
+	if p.Jobs != nil && res.UploadRef != "" && len(res.Pending) > 0 {
+		if err := p.Jobs.Enqueue(ctx, ev.Data.EmailID, res.UploadRef, res.Pending); err != nil {
+			// The mail is filed already; answering with a failure makes Resend retry,
+			// which forwards it again (idempotent) and queues the files again.
+			return "", &RetryableError{Err: fmt.Errorf("queue received attachments: %w", err)}
+		}
 	}
 	return OutcomeForwarded, nil
 }
