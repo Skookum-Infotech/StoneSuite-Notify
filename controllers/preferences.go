@@ -63,7 +63,7 @@ func (h *PreferencesHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var in preferences.OverrideInput
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxUserBodyBytes)).Decode(&in); err != nil {
 		fail(w, http.StatusBadRequest, "Invalid request body.")
 		return
 	}
@@ -121,7 +121,7 @@ type tenantDefaultsRequest struct {
 // the internal notification-create endpoint is.
 func (h *PreferencesHandler) SetTenantDefaults(w http.ResponseWriter, r *http.Request) {
 	var req tenantDefaultsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxUserBodyBytes)).Decode(&req); err != nil {
 		fail(w, http.StatusBadRequest, "Invalid request body.")
 		return
 	}
@@ -171,7 +171,7 @@ func (h *PreferencesHandler) AdminSetTenantDefaults(w http.ResponseWriter, r *ht
 	}
 
 	var in preferences.TenantDefaultsInput
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxUserBodyBytes)).Decode(&in); err != nil {
 		fail(w, http.StatusBadRequest, "Invalid request body.")
 		return
 	}

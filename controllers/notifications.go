@@ -324,7 +324,7 @@ const (
 // by middleware.RequireInternalSecret rather than end-user auth.
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	var req createNotificationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxCreateBodyBytes)).Decode(&req); err != nil {
 		fail(w, http.StatusBadRequest, "Invalid request body.")
 		return
 	}
@@ -335,6 +335,10 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Recipients) == 0 {
 		fail(w, http.StatusBadRequest, "recipients is required.")
+		return
+	}
+	if len(req.Recipients) > maxRecipients {
+		fail(w, http.StatusBadRequest, "too many recipients.")
 		return
 	}
 	if utf8.RuneCountInString(req.StatusLink) > maxStatusLinkChars {

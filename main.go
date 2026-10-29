@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -70,6 +71,17 @@ func main() {
 		log.Println("notice: no VAPID keys configured (VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY) — push channel will be skipped")
 	}
 
+	// Background workers are tracked so shutdown can wait for in-flight sends
+	// to record their outcome before the pool closes.
+	var workerWG sync.WaitGroup
+	startWorker := func(run func(context.Context)) {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			run(ctx)
+		}()
+	}
+
 	store := notifications.NewPGStore(pool)
 	pushStore := pushsubs.NewPGStore(pool)
 	prefStore := preferences.NewPGStore(pool)
@@ -102,12 +114,12 @@ func main() {
 			Lister:    resend,
 			Jobs:      jobStore,
 		})
-		go workers.InboundAttachmentWorker{Jobs: jobStore, Lister: resend, Downloader: resend, Uploader: forwarder}.Run(ctx)
+		startWorker(workers.InboundAttachmentWorker{Jobs: jobStore, Lister: resend, Downloader: resend, Uploader: forwarder}.Run)
 	}
 
 	workerDeps := workers.NewDeps(store, deliveryStore, pushStore, auditRecorder, cfg)
-	go workers.QueueConsumer{Deps: workerDeps}.Run(ctx)
-	go workers.RetryWorker{Deps: workerDeps}.Run(ctx)
+	startWorker(workers.QueueConsumer{Deps: workerDeps}.Run)
+	startWorker(workers.RetryWorker{Deps: workerDeps}.Run)
 
 	mux := http.NewServeMux()
 
@@ -179,15 +191,26 @@ func main() {
 		Addr:              ":" + cfg.Port,
 		Handler:           globalHandler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      90 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
 
+	// ListenAndServe returns the moment Shutdown starts, so main must wait on
+	// done or the process exits before in-flight work is flushed.
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("server shutdown: %v", err)
 		}
+		// Workers observe the cancelled ctx; wait for the one in flight to
+		// record its outcome (this also covers the audit writes it queues).
+		workerWG.Wait()
 		// Audit writes are detached from their request, so in-flight
 		// entries would be lost if the process exited immediately after
 		// the last response.
@@ -202,6 +225,7 @@ func main() {
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("CRITICAL: server: %v", err)
 	}
+	<-done
 }
 
 // withCORS echoes the request Origin back only if it is in the configured
