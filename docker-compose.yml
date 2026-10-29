@@ -1,0 +1,68 @@
+# Runs the notify service itself in Docker, on top of the dev Postgres +
+# Mailpit stack in docker-compose.dev.yml (pulled in via `include`, so the
+# two are never defined twice). This is the "backend in Docker talks to
+# notify in Docker" setup: notify publishes :8090 on the host, and
+# StoneSuite-Backend reaches it at http://host.docker.internal:8090 (see the
+# NOTIFY_URL override in StoneSuite-Backend/docker-compose.yml).
+#
+#   docker compose up -d --build     # notify + Postgres + Mailpit
+#   docker compose logs -f notify
+#   docker compose down              # add -v to also drop the Postgres volume
+#
+# Mail is captured by Mailpit (UI: http://localhost:8025), never delivered.
+# For real delivery set RESEND_API_KEY in .env — notify tries Resend before
+# SMTP, so a key in .env makes it bypass Mailpit — and use an EMAIL_FROM on a
+# domain verified in Resend.
+#
+# Shares host ports 5544/1025/8025 with scripts/dev-up.sh (the run-on-host
+# flow), so run one or the other, not both.
+name: stonesuite-notify
+
+include:
+  - docker-compose.dev.yml
+
+services:
+  notify:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stonesuite-notify
+    restart: unless-stopped
+    # Secrets (JWT_SECRET, INTERNAL_SERVICE_SECRET, VAPID_*, EMAIL_FROM) come
+    # from .env. JWT_SECRET must equal StoneSuite-Backend's JWT_SECRET, and
+    # INTERNAL_SERVICE_SECRET must equal the backend's NOTIFY_API_KEY.
+    env_file:
+      - .env
+    environment:
+      # Overrides for .env values that are host-specific (localhost:5544 /
+      # localhost:1025): inside the compose network the dependencies are
+      # reachable by service name.
+      DATABASE_URL: postgres://notify:notify@postgres:5432/stonesuite_notify?sslmode=disable
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      PORT: "8090"
+    ports:
+      - "8090:8090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8090/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  adminer:
+    image: adminer:latest
+    container_name: stonesuite-notify-adminer
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    ports:
+      - "8082:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy

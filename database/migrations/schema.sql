@@ -178,9 +178,10 @@ CREATE TABLE IF NOT EXISTS service_api_keys (
 CREATE INDEX IF NOT EXISTS idx_service_api_keys_environment
     ON service_api_keys (environment, active);
 
--- notification_attachments holds at most one binary attachment per
--- notification — currently used only for the "document sent" owner
--- notification, which carries the same PDF the customer received. This is
+-- notification_attachments holds the first binary attachment of a
+-- notification (further files live in notification_attachment_files, below),
+-- its custom email body and its header overrides. The "document sent" emails
+-- carry their PDF here. This is
 -- deliberately its own table, not a column on notifications: notifications
 -- is read in bulk by the feed/list/summary endpoints backing the in-app
 -- bell UI, and this table is read only by the email delivery worker, one
@@ -219,9 +220,101 @@ ALTER TABLE notification_deliveries ALTER COLUMN recipient_user_id DROP NOT NULL
 -- the generic template"; see channels.SendNotificationEmail.
 ALTER TABLE notification_attachments ADD COLUMN IF NOT EXISTS email_body_html TEXT NOT NULL DEFAULT '';
 
+-- Optional per-notification email header overrides (reply_to, from name,
+-- In-Reply-To / References), JSON of notifications.EmailOptions. Lets a caller
+-- route a customer's reply to a specific record and keep it in the same mail
+-- thread. '{}' means "use the service-wide defaults".
+ALTER TABLE notification_attachments ADD COLUMN IF NOT EXISTS email_options JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- notification_attachment_files holds the files of a notification email beyond
+-- the first one, which stays in notification_attachments (file_name / content).
+-- A Communication-tab reply can carry several files; the document-send PDF and
+-- every row written before this table existed are unaffected. position keeps the
+-- order the caller sent them in (the second file is position 0).
+CREATE TABLE IF NOT EXISTS notification_attachment_files (
+    notification_id UUID        NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+    position        INT         NOT NULL,
+    file_name       TEXT        NOT NULL,
+    content_type    TEXT        NOT NULL,
+    content         BYTEA       NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (notification_id, position)
+);
+
 -- Serves the "list a tenant's deliveries by status since T" query
 -- (deliveries.Store.ListByStatus) behind the admin/ops "what failed?"
 -- view. Distinct from idx_deliveries_claim (status, next_attempt_at),
 -- which is workers-only and not tenant-scoped.
 CREATE INDEX IF NOT EXISTS idx_deliveries_tenant_status
     ON notification_deliveries (tenant_id, status, updated_at DESC);
+
+-- ── Provider (Resend) delivery lifecycle ──────────────────────────────
+-- notification_deliveries.status is the SEND-QUEUE state the workers claim on
+-- (pending -> sent/retrying/failed). What the email provider reports AFTER
+-- accepting a message (delivered / delayed / bounced / complained / ...) is a
+-- different thing and lives in its own columns so the two can never be
+-- confused or race. provider_email_id is Resend's id for the sent email -- the
+-- key the webhook uses to find its row. NULL for SMTP sends (no webhooks).
+ALTER TABLE notification_deliveries ADD COLUMN IF NOT EXISTS provider_email_id  TEXT;
+ALTER TABLE notification_deliveries ADD COLUMN IF NOT EXISTS provider_status    VARCHAR(24);
+ALTER TABLE notification_deliveries ADD COLUMN IF NOT EXISTS provider_status_at TIMESTAMPTZ;
+ALTER TABLE notification_deliveries ADD COLUMN IF NOT EXISTS provider_detail    TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deliveries_provider_email
+    ON notification_deliveries (provider_email_id) WHERE provider_email_id IS NOT NULL;
+
+-- Where the sender should land when an in-app delivery-problem alert is
+-- clicked (the staff-side page that shows the email's status badge). Distinct
+-- from link, which for a customer document email is the CUSTOMER's URL.
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS status_link VARCHAR(300) NOT NULL DEFAULT '';
+
+-- The RBAC resource that governs the page status_link opens ("invoice", "user",
+-- "portal_access", ...). The in-app bell only shows a notification whose resource
+-- the reader may Read, so a delivery-problem alert must carry THIS resource, not
+-- the original email's: e.g. a portal invite's resource "portal_user" is not an
+-- RBAC resource at all, and an alert copied from it would be invisible to every
+-- sender who is not a super admin. Empty => fall back to the original's resource.
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS status_resource VARCHAR(64) NOT NULL DEFAULT '';
+
+-- Append-only log of provider webhook events that matched a delivery.
+-- svix_id is Resend's per-message id: UNIQUE makes a redelivered webhook a
+-- no-op. The raw payload is deliberately NOT stored (it carries the recipient
+-- address and subject); only the event type, time and a short detail string.
+CREATE TABLE IF NOT EXISTS email_events (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    svix_id           TEXT        NOT NULL UNIQUE,
+    delivery_id       UUID        NOT NULL REFERENCES notification_deliveries(id) ON DELETE CASCADE,
+    tenant_id         UUID        NOT NULL,
+    provider_email_id TEXT        NOT NULL,
+    event_type        VARCHAR(32) NOT NULL,
+    occurred_at       TIMESTAMPTZ NOT NULL,
+    detail            TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_events_delivery
+    ON email_events (delivery_id, occurred_at);
+
+-- ── inbound_attachment_jobs ─────────────────────────────────────────────
+-- One row per file of a received customer reply that still has to be copied to
+-- StoneSuite-Backend. The webhook only enqueues (it must answer Resend quickly);
+-- a worker downloads each file from Resend and uploads it, deleting the row on
+-- success. upload_ref is the reply-address token the backend asked the file to be
+-- sent under: it names a record, so it is blanked once a job gives up.
+-- status: 'pending' (due at next_attempt_at), 'processing' (claimed; reclaimed if
+-- it sits that way too long, as after a crash), 'failed' (gave up, kept for ops).
+CREATE TABLE IF NOT EXISTS inbound_attachment_jobs (
+    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    email_id        TEXT        NOT NULL,
+    attachment_id   TEXT        NOT NULL,
+    upload_ref      TEXT        NOT NULL,
+    status          TEXT        NOT NULL DEFAULT 'pending',
+    attempts        INT         NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_error      TEXT        NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (email_id, attachment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_inbound_attachment_jobs_due
+    ON inbound_attachment_jobs (status, next_attempt_at);

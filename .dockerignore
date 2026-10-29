@@ -1,0 +1,7 @@
+# Keep secrets and repo noise out of the build context: the Dockerfile's
+# `COPY . .` would otherwise put .env into the builder stage's layers.
+.git
+.claude
+.env
+.env.*
+docs

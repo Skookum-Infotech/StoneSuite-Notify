@@ -52,12 +52,16 @@ func (h *PushHandler) Subscribe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req subscribeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxUserBodyBytes)).Decode(&req); err != nil {
 		fail(w, http.StatusBadRequest, "Invalid request body.")
 		return
 	}
 	if req.Endpoint == "" || req.Keys.P256dh == "" || req.Keys.Auth == "" {
 		fail(w, http.StatusBadRequest, "endpoint and keys.p256dh and keys.auth are required.")
+		return
+	}
+	if err := pushsubs.Validate(req.Endpoint, req.Keys.P256dh, req.Keys.Auth); err != nil {
+		fail(w, http.StatusBadRequest, "Invalid push subscription: "+err.Error()+".")
 		return
 	}
 
@@ -96,7 +100,7 @@ func (h *PushHandler) Unsubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req unsubscribeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxUserBodyBytes)).Decode(&req); err != nil {
 		fail(w, http.StatusBadRequest, "Invalid request body.")
 		return
 	}

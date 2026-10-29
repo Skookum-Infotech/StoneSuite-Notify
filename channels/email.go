@@ -14,6 +14,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/mail"
 	"net/smtp"
 	"net/textproto"
 	"regexp"
@@ -23,15 +24,18 @@ import (
 	"stonesuite-notify/config"
 )
 
-const emailTimeout = 10 * time.Second
+// emailTimeout bounds one call to the email provider. A message can carry several
+// files (about 7 MB once encoded), and a timeout after the provider has accepted
+// the mail would send it twice on retry, so this leaves room for the upload.
+const emailTimeout = 30 * time.Second
 
 // resendEndpoint is Resend's send-email API. A package var, not a const, so
 // tests can point it at an httptest server.
 var resendEndpoint = "https://api.resend.com/emails"
 
-// EmailAttachment is the single file this channel can attach to a
-// notification email — currently only ever the PDF from a "document sent"
-// event. Defined here (not imported from notifications) so this package
+// EmailAttachment is one file attached to a notification email: the PDF of a
+// "document sent" event, or the files staff attach to a Communication-tab
+// reply. Defined here (not imported from notifications) so this package
 // stays dependency-free of the domain layer, matching its existing
 // config-only import list.
 type EmailAttachment struct {
@@ -40,21 +44,83 @@ type EmailAttachment struct {
 	Content     []byte
 }
 
+// EmailOptions are the per-message header overrides a caller can request on
+// top of the service-wide defaults: a Reply-To that routes a customer's reply
+// back to a specific record, a human sender name, and the threading headers
+// that make Gmail/Outlook keep a reply in the same conversation. The zero value
+// changes nothing.
+type EmailOptions struct {
+	ReplyTo    string
+	FromName   string
+	InReplyTo  string
+	References string
+}
+
+// replyTo returns the Reply-To to use: the per-message one when set, else the
+// service-wide EMAIL_REPLY_TO.
+func (o EmailOptions) replyTo(cfg config.Config) string {
+	if o.ReplyTo != "" {
+		return sanitizeHeader(o.ReplyTo)
+	}
+	return cfg.EmailReplyTo
+}
+
+// from returns the From header value: the configured sender address, shown
+// under FromName when one is given. mail.Address quotes and RFC 2047-encodes
+// the name, so a name with commas, quotes or non-ASCII text stays valid.
+func (o EmailOptions) from(cfg config.Config) string {
+	name := sanitizeHeader(o.FromName)
+	if name == "" {
+		return cfg.EmailFrom
+	}
+	parsed, err := mail.ParseAddress(cfg.EmailFrom)
+	if err != nil {
+		return cfg.EmailFrom
+	}
+	return (&mail.Address{Name: name, Address: parsed.Address}).String()
+}
+
+// threadHeaders returns the In-Reply-To / References pair for a reply, or nil
+// when neither is set.
+func (o EmailOptions) threadHeaders() map[string]string {
+	h := map[string]string{}
+	if v := sanitizeHeader(o.InReplyTo); v != "" {
+		h["In-Reply-To"] = v
+	}
+	if v := sanitizeHeader(o.References); v != "" {
+		h["References"] = v
+	}
+	if len(h) == 0 {
+		return nil
+	}
+	return h
+}
+
+// sanitizeHeader drops CR/LF so a caller-supplied value can never inject an
+// extra header line into the message.
+func sanitizeHeader(v string) string {
+	return strings.TrimSpace(strings.NewReplacer("\r", "", "\n", "").Replace(v))
+}
+
 // SendNotificationEmail delivers a notification over email, choosing a
 // provider the same way StoneSuite-Backend's services/email.go does:
 // Resend if configured, else SMTP. A missing provider or a missing
 // EMAIL_FROM returns an error (the delivery then retries and goes
 // terminal with a reason) rather than a silent no-op, since a delivery
 // row only reaches this function when email was actually requested.
-// attachment is optional (nil for the overwhelming majority of
-// notifications). When emailBodyHTML is non-empty, it is used verbatim as
+// attachments is optional (none for the overwhelming majority of
+// notifications) and goes out in the order given. When emailBodyHTML is
+// non-empty, it is used verbatim as
 // the message body instead of the generic <h2>title</h2><p>body</p>
 // template — used by callers (e.g. a document-send customer email) that
 // need their own branding. Errors are returned for the worker to log and
 // retry on, never surfaced to the notification-create response.
-func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHTML string, attachment *EmailAttachment) error {
+// It returns the provider's id for the sent email (Resend only; "" for SMTP),
+// which the worker stores so the provider's delivery webhooks can be matched
+// to this delivery.
+func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHTML string, attachments []EmailAttachment, opts EmailOptions) (string, error) {
 	if to == "" {
-		return fmt.Errorf("email channel: recipient address is empty")
+		return "", fmt.Errorf("email channel: recipient address is empty")
 	}
 	// A configured provider with no EMAIL_FROM cannot send: Resend rejects
 	// the request with HTTP 422 (invalid "from"), and SMTP has no envelope
@@ -63,7 +129,7 @@ func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHT
 	// secret, easy to drop in a secrets reset and (historically) documented
 	// only under SMTP.
 	if cfg.EmailConfigured() && cfg.EmailFrom == "" {
-		return fmt.Errorf("email channel: EMAIL_FROM is not set (required as the sender address for Resend and SMTP alike)")
+		return "", fmt.Errorf("email channel: EMAIL_FROM is not set (required as the sender address for Resend and SMTP alike)")
 	}
 
 	htmlBody := emailBodyHTML
@@ -79,15 +145,15 @@ func SendNotificationEmail(cfg config.Config, to, title, body, link, emailBodyHT
 
 	switch {
 	case cfg.ResendAPIKey != "":
-		return sendViaResend(cfg, to, title, htmlBody, textBody, attachment)
+		return sendViaResend(cfg, to, title, htmlBody, textBody, attachments, opts)
 	case cfg.SMTPHost != "":
-		return sendViaSMTP(cfg, to, title, htmlBody, textBody, attachment)
+		return "", sendViaSMTP(cfg, to, title, htmlBody, textBody, attachments, opts)
 	default:
 		// A delivery row only reaches this worker because Create decided
 		// email was wanted and enabled — so "no provider" here is a
 		// misconfiguration, not a no-op. Return an error so the delivery
 		// goes retrying -> failed with a clear reason, never marked sent.
-		return fmt.Errorf("email channel: no provider configured (set RESEND_API_KEY or SMTP_HOST, plus EMAIL_FROM)")
+		return "", fmt.Errorf("email channel: no provider configured (set RESEND_API_KEY or SMTP_HOST, plus EMAIL_FROM)")
 	}
 }
 
@@ -133,51 +199,62 @@ func htmlToPlainText(h string) string {
 }
 
 type resendAttachment struct {
-	Filename string `json:"filename"`
-	Content  string `json:"content"`
+	Filename    string `json:"filename"`
+	Content     string `json:"content"`
+	ContentType string `json:"content_type,omitempty"`
 }
 
 type resendRequest struct {
 	From        string             `json:"from"`
 	To          string             `json:"to"`
 	ReplyTo     string             `json:"reply_to,omitempty"`
+	Headers     map[string]string  `json:"headers,omitempty"`
 	Subject     string             `json:"subject"`
 	HTML        string             `json:"html"`
 	Text        string             `json:"text,omitempty"`
 	Attachments []resendAttachment `json:"attachments,omitempty"`
 }
 
-func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, attachment *EmailAttachment) error {
+// resendResponse is the success body of Resend's POST /emails.
+type resendResponse struct {
+	ID string `json:"id"`
+}
+
+// sendViaResend sends through Resend and returns Resend's id for the accepted
+// email ("" if the response carried none).
+func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, attachments []EmailAttachment, opts EmailOptions) (string, error) {
 	req := resendRequest{
-		From:    cfg.EmailFrom,
+		From:    opts.from(cfg),
 		To:      to,
-		ReplyTo: cfg.EmailReplyTo,
+		ReplyTo: opts.replyTo(cfg),
+		Headers: opts.threadHeaders(),
 		Subject: subject,
 		HTML:    htmlBody,
 		Text:    textBody,
 	}
-	if attachment != nil {
-		req.Attachments = []resendAttachment{{
-			Filename: attachment.FileName,
-			Content:  base64.StdEncoding.EncodeToString(attachment.Content),
-		}}
+	for _, a := range attachments {
+		req.Attachments = append(req.Attachments, resendAttachment{
+			Filename:    a.FileName,
+			Content:     base64.StdEncoding.EncodeToString(a.Content),
+			ContentType: a.ContentType,
+		})
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("resend: encode request: %w", err)
+		return "", fmt.Errorf("resend: encode request: %w", err)
 	}
 
 	client := &http.Client{Timeout: emailTimeout}
 	httpReq, err := http.NewRequest(http.MethodPost, resendEndpoint, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("resend: build request: %w", err)
+		return "", fmt.Errorf("resend: build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+cfg.ResendAPIKey)
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("resend: send: %w", err)
+		return "", fmt.Errorf("resend: send: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -187,14 +264,21 @@ func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, at
 		// bare status code hides. This lands in notification_deliveries.last_error
 		// and the worker log, so a recurring 422 is self-diagnosing.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return fmt.Errorf("resend: unexpected status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
+		return "", fmt.Errorf("resend: unexpected status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
 	}
-	return nil
+
+	// The email was accepted. Its id is what Resend's later delivery webhooks
+	// refer to; failing to read it must not fail a send that already happened.
+	var accepted resendResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&accepted); err != nil {
+		return "", nil
+	}
+	return accepted.ID, nil
 }
 
-func sendViaSMTP(cfg config.Config, to, subject, htmlBody, textBody string, attachment *EmailAttachment) error {
+func sendViaSMTP(cfg config.Config, to, subject, htmlBody, textBody string, attachments []EmailAttachment, opts EmailOptions) error {
 	addr := cfg.SMTPHost + ":" + cfg.SMTPPort
-	msg := buildSMTPMessage(to, cfg.EmailFrom, cfg.EmailReplyTo, subject, htmlBody, textBody, attachment)
+	msg := buildSMTPMessage(to, opts.from(cfg), opts.replyTo(cfg), subject, htmlBody, textBody, attachments, opts)
 
 	var auth smtp.Auth
 	if cfg.SMTPUsername != "" {
@@ -234,21 +318,34 @@ func mimeBody(htmlBody, altText string) (contentType string, body []byte) {
 
 // buildSMTPMessage assembles the raw RFC 5322 message. The body is a
 // text/html part, or a multipart/alternative (text/plain then text/html) when
-// a plain-text alternative is supplied; an attachment wraps that body in an
-// outer multipart/mixed. Mirrors the html/text/reply_to shape Resend builds,
-// so both providers deliver the same message.
-func buildSMTPMessage(to, from, replyTo, subject, htmlBody, textBody string, attachment *EmailAttachment) []byte {
+// a plain-text alternative is supplied; attachments wrap that body in an
+// outer multipart/mixed, one part each in the order given. Mirrors the
+// html/text/reply_to shape Resend builds, so both providers deliver the same
+// message.
+func buildSMTPMessage(to, from, replyTo, subject, htmlBody, textBody string, attachments []EmailAttachment, opts EmailOptions) []byte {
 	bodyCT, bodyBytes := mimeBody(htmlBody, textBody)
 
 	var buf bytes.Buffer
 	buf.WriteString("To: " + to + "\r\n")
+	// The From header is only written when a sender name was requested; the
+	// envelope sender (smtp.SendMail's from argument) is what the server
+	// authenticates, and an unnamed message keeps the provider's default.
+	if opts.FromName != "" {
+		buf.WriteString("From: " + from + "\r\n")
+	}
 	if replyTo != "" {
 		buf.WriteString("Reply-To: " + replyTo + "\r\n")
+	}
+	threading := opts.threadHeaders()
+	for _, name := range []string{"In-Reply-To", "References"} {
+		if v, ok := threading[name]; ok {
+			buf.WriteString(name + ": " + v + "\r\n")
+		}
 	}
 	buf.WriteString("Subject: " + subject + "\r\n")
 	buf.WriteString("MIME-Version: 1.0\r\n")
 
-	if attachment == nil {
+	if len(attachments) == 0 {
 		buf.WriteString("Content-Type: " + bodyCT + "\r\n\r\n")
 		buf.Write(bodyBytes)
 		buf.WriteString("\r\n")
@@ -264,24 +361,34 @@ func buildSMTPMessage(to, from, replyTo, subject, htmlBody, textBody string, att
 		_, _ = pw.Write(bodyBytes)
 	}
 
-	ct := attachment.ContentType
-	if ct == "" {
-		ct = "application/octet-stream"
-	}
-	attHdr := textproto.MIMEHeader{}
-	attHdr.Set("Content-Type", ct)
-	attHdr.Set("Content-Transfer-Encoding", "base64")
-	attHdr.Set("Content-Disposition", `attachment; filename="`+attachment.FileName+`"`)
-	if pw, err := mw.CreatePart(attHdr); err == nil {
-		b64 := base64.StdEncoding.EncodeToString(attachment.Content)
-		for i := 0; i < len(b64); i += 76 {
-			end := i + 76
-			if end > len(b64) {
-				end = len(b64)
+	for _, attachment := range attachments {
+		ct := sanitizeHeader(attachment.ContentType)
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		attHdr := textproto.MIMEHeader{}
+		attHdr.Set("Content-Type", ct)
+		attHdr.Set("Content-Transfer-Encoding", "base64")
+		attHdr.Set("Content-Disposition", `attachment; filename="`+quotedFileName(attachment.FileName)+`"`)
+		if pw, err := mw.CreatePart(attHdr); err == nil {
+			b64 := base64.StdEncoding.EncodeToString(attachment.Content)
+			for i := 0; i < len(b64); i += 76 {
+				end := i + 76
+				if end > len(b64) {
+					end = len(b64)
+				}
+				pw.Write([]byte(b64[i:end] + "\r\n"))
 			}
-			pw.Write([]byte(b64[i:end] + "\r\n"))
 		}
 	}
 	_ = mw.Close()
 	return buf.Bytes()
+}
+
+// quotedFileName makes a file name safe inside a quoted Content-Disposition
+// parameter: no CR/LF (header injection) and no quote or backslash that would end
+// or escape the quoted string. File names now come from staff uploads, not only
+// from a rendered PDF, so they are not trusted.
+func quotedFileName(name string) string {
+	return strings.NewReplacer("\r", "", "\n", "", `"`, "'", `\`, "_").Replace(name)
 }

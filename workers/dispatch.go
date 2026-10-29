@@ -9,8 +9,11 @@ package workers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"runtime/debug"
+	"time"
 
 	"stonesuite-notify/audit"
 	"stonesuite-notify/channels"
@@ -30,7 +33,7 @@ type Deps struct {
 	PushSubs      pushsubs.Store
 	Audit         audit.Recorder
 	Config        config.Config
-	SendEmail     func(cfg config.Config, to, title, body, link, emailBodyHTML string, attachment *channels.EmailAttachment) error
+	SendEmail     func(cfg config.Config, to, title, body, link, emailBodyHTML string, attachments []channels.EmailAttachment, opts channels.EmailOptions) (string, error)
 	SendPush      func(cfg config.Config, sub channels.PushSubscription, title, body, link string) (stale bool, err error)
 }
 
@@ -88,9 +91,23 @@ type pushProviderResponse struct {
 // Shared by QueueConsumer and RetryWorker so claim-then-send behaves
 // identically regardless of which ticker picked the row up.
 func attemptDelivery(ctx context.Context, deps Deps, d deliveries.Delivery) {
+	// A panic in one delivery (bad key material, nil dereference) must not
+	// take down the worker or the whole process, nor leave the row to be
+	// reclaimed and crash again: record it as a failed attempt.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("workers: panic delivering %s: %v\n%s", d.ID, r, debug.Stack())
+			markFailedAttempt(ctx, deps, d, fmt.Sprintf("panic: %v", r), nil)
+		}
+	}()
+
 	n, err := deps.Notifications.Get(ctx, d.TenantID, d.NotificationID)
 	if err != nil {
 		log.Printf("workers: load notification %s for delivery %s: %v", d.NotificationID, d.ID, err)
+		if errors.Is(err, notifications.ErrNotFound) {
+			// Retrying cannot bring a deleted notification back.
+			d.Attempts = deliveries.MaxAttempts - 1
+		}
 		markFailedAttempt(ctx, deps, d, fmt.Sprintf("load notification: %v", err), nil)
 		return
 	}
@@ -102,28 +119,48 @@ func attemptDelivery(ctx context.Context, deps Deps, d deliveries.Delivery) {
 		attemptPush(ctx, deps, d, *n)
 	default:
 		log.Printf("workers: delivery %s has unsupported channel %q for worker dispatch", d.ID, d.Channel)
+		// Leaving the row 'processing' would only get it reclaimed forever.
+		d.Attempts = deliveries.MaxAttempts - 1
+		markFailedAttempt(ctx, deps, d, fmt.Sprintf("unsupported channel %q", d.Channel), nil)
 	}
 }
 
 func attemptEmail(ctx context.Context, deps Deps, d deliveries.Delivery, n notifications.Notification) {
-	var attachment *channels.EmailAttachment
+	var attachments []channels.EmailAttachment
 	var emailBodyHTML string
+	var emailOpts channels.EmailOptions
 	att, err := deps.Notifications.GetAttachment(ctx, n.TenantID, n.ID)
 	if err != nil {
+		// Sending without the PDF/branded body and marking it sent would be
+		// a silent partial delivery; retry instead.
 		log.Printf("workers: load attachment for notification %s: %v", n.ID, err)
+		markFailedAttempt(ctx, deps, d, fmt.Sprintf("load attachment: %v", err), nil)
+		return
 	} else if att != nil {
 		emailBodyHTML = att.EmailBodyHTML
+		emailOpts = channels.EmailOptions{
+			ReplyTo:    att.EmailOptions.ReplyTo,
+			FromName:   att.EmailOptions.FromName,
+			InReplyTo:  att.EmailOptions.InReplyTo,
+			References: att.EmailOptions.References,
+		}
 		if att.FileName != "" {
-			attachment = &channels.EmailAttachment{FileName: att.FileName, ContentType: att.ContentType, Content: att.Content}
+			attachments = append(attachments, channels.EmailAttachment{FileName: att.FileName, ContentType: att.ContentType, Content: att.Content})
+		}
+		for _, f := range att.MoreFiles {
+			attachments = append(attachments, channels.EmailAttachment{FileName: f.FileName, ContentType: f.ContentType, Content: f.Content})
 		}
 	}
 
-	if err := deps.SendEmail(deps.Config, n.RecipientEmail, n.Title, n.Body, n.Link, emailBodyHTML, attachment); err != nil {
+	providerID, err := deps.SendEmail(deps.Config, n.RecipientEmail, n.Title, n.Body, n.Link, emailBodyHTML, attachments, emailOpts)
+	if err != nil {
 		log.Printf("workers: email delivery %s: %v", d.ID, err)
 		markFailedAttempt(ctx, deps, d, err.Error(), nil)
 		return
 	}
-	if err := deps.Deliveries.MarkSent(ctx, d.ID, nil); err != nil {
+	octx, cancel := outcomeContext(ctx)
+	defer cancel()
+	if err := deps.Deliveries.MarkSent(octx, d.ID, nil, providerID); err != nil {
 		log.Printf("workers: mark email delivery %s sent: %v", d.ID, err)
 	}
 	recordOutcome(ctx, deps, d, audit.ActionDeliverySent, map[string]any{})
@@ -137,7 +174,9 @@ func attemptPush(ctx context.Context, deps Deps, d deliveries.Delivery, n notifi
 		return
 	}
 	if len(subs) == 0 {
-		if err := deps.Deliveries.MarkSkipped(ctx, d.ID, mustMarshalSkipped()); err != nil {
+		octx, cancel := outcomeContext(ctx)
+		defer cancel()
+		if err := deps.Deliveries.MarkSkipped(octx, d.ID, mustMarshalSkipped()); err != nil {
 			log.Printf("workers: mark push delivery %s skipped: %v", d.ID, err)
 		}
 		return
@@ -174,7 +213,9 @@ func attemptPush(ctx context.Context, deps Deps, d deliveries.Delivery, n notifi
 	responseJSON, _ := json.Marshal(pushProviderResponse{Endpoints: outcomes})
 
 	if allSent {
-		if err := deps.Deliveries.MarkSent(ctx, d.ID, responseJSON); err != nil {
+		octx, cancel := outcomeContext(ctx)
+		defer cancel()
+		if err := deps.Deliveries.MarkSent(octx, d.ID, responseJSON, ""); err != nil {
 			log.Printf("workers: mark push delivery %s sent: %v", d.ID, err)
 		}
 		recordOutcome(ctx, deps, d, audit.ActionDeliverySent, map[string]any{"endpoints": len(outcomes)})
@@ -189,6 +230,8 @@ func attemptPush(ctx context.Context, deps Deps, d deliveries.Delivery, n notifi
 func markFailedAttempt(ctx context.Context, deps Deps, d deliveries.Delivery, lastError string, providerResponse []byte) {
 	attempts := d.Attempts + 1
 
+	ctx, cancel := outcomeContext(ctx)
+	defer cancel()
 	if err := deps.Deliveries.MarkRetrying(ctx, d.ID, attempts, lastError, providerResponse); err != nil {
 		log.Printf("workers: mark delivery %s retrying: %v", d.ID, err)
 	}
@@ -201,6 +244,13 @@ func markFailedAttempt(ctx context.Context, deps Deps, d deliveries.Delivery, la
 			d.ID, d.NotificationID, d.TenantID, d.Channel, d.RecipientUserID, attempts, lastError)
 		recordOutcome(ctx, deps, d, audit.ActionDeliveryFailed, map[string]any{"lastError": lastError})
 	}
+}
+
+// outcomeContext detaches outcome writes from the worker's cancellation: after
+// SIGTERM a mail that already went out must still be recorded as sent, or the
+// stale-row recovery sends it a second time.
+func outcomeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 }
 
 func decodePushResponse(raw []byte) pushProviderResponse {

@@ -50,6 +50,12 @@ type Delivery struct {
 	// json.RawMessage (not []byte) so the stored provider payload is
 	// embedded as JSON in API responses rather than base64-encoded.
 	ProviderResponse json.RawMessage `json:"providerResponse,omitempty"`
+	// ProviderStatus is what the email provider reported after accepting the
+	// message (delivered, bounced, …); empty until a webhook arrives, and
+	// always empty for non-email channels. Distinct from Status, which is the
+	// send-queue state.
+	ProviderStatus   string     `json:"providerStatus,omitempty"`
+	ProviderStatusAt *time.Time `json:"providerStatusAt,omitempty"`
 	CreatedAt        time.Time       `json:"createdAt"`
 	UpdatedAt        time.Time       `json:"updatedAt"`
 }

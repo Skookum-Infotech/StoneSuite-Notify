@@ -5,6 +5,7 @@ package middleware
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -63,7 +64,7 @@ func RequireAuth(jwtSecret string) func(http.Handler) http.Handler {
 					return nil, errors.New("unexpected signing method")
 				}
 				return []byte(jwtSecret), nil
-			})
+			}, jwt.WithValidMethods([]string{"HS256"}))
 			if err != nil || !token.Valid {
 				message := "Authentication failed. Invalid or malformed token."
 				if errors.Is(err, jwt.ErrTokenExpired) {
@@ -151,7 +152,7 @@ func RequireInternalSecret(secret string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			if r.Header.Get("X-Internal-Secret") != secret {
+			if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Internal-Secret")), []byte(secret)) != 1 {
 				deny(w, http.StatusUnauthorized, "Access denied. Invalid internal service credentials.")
 				return
 			}

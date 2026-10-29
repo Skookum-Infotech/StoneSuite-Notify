@@ -1,6 +1,7 @@
 package channels
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
@@ -38,7 +39,10 @@ func SendWebPush(cfg config.Config, sub PushSubscription, title, body, link stri
 		return false, fmt.Errorf("push: encode payload: %w", err)
 	}
 
-	resp, err := webpush.SendNotification(payload, &webpush.Subscription{
+	ctx, cancel := context.WithTimeout(context.Background(), pushRequestTimeout)
+	defer cancel()
+
+	resp, err := webpush.SendNotificationWithContext(ctx, payload, &webpush.Subscription{
 		Endpoint: sub.Endpoint,
 		Keys: webpush.Keys{
 			P256dh: sub.P256dh,
@@ -49,6 +53,7 @@ func SendWebPush(cfg config.Config, sub PushSubscription, title, body, link stri
 		VAPIDPublicKey:  cfg.VAPIDPublicKey,
 		VAPIDPrivateKey: cfg.VAPIDPrivateKey,
 		TTL:             60,
+		HTTPClient:      pushHTTPClient,
 	})
 	if err != nil {
 		return false, fmt.Errorf("push: send: %w", err)

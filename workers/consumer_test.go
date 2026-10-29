@@ -33,7 +33,9 @@ func TestQueueConsumer_PollOnce_AttemptsClaimedDeliveries(t *testing.T) {
 		Notifications: notifStore,
 		Deliveries:    delivStore,
 		PushSubs:      &fakePushSubs{},
-		SendEmail:     func(_ config.Config, _, _, _, _, _ string, _ *channels.EmailAttachment) error { return nil },
+		SendEmail: func(_ config.Config, _, _, _, _, _ string, _ []channels.EmailAttachment, _ channels.EmailOptions) (string, error) {
+			return "", nil
+		},
 	}
 
 	QueueConsumer{Deps: deps}.pollOnce(context.Background())

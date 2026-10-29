@@ -25,7 +25,10 @@ type Store interface {
 	// than staleProcessingAfter (a crash mid-send), recovering the latter
 	// as if it were a failed attempt.
 	ClaimDue(ctx context.Context, batchSize int, staleProcessingAfter time.Duration) ([]Delivery, error)
-	MarkSent(ctx context.Context, id string, providerResponse []byte) error
+	// MarkSent finalizes a delivery as sent. providerEmailID is the email
+	// provider's id for the message (Resend), recorded so its delivery
+	// webhooks can be matched to this row; "" when there is none (push, SMTP).
+	MarkSent(ctx context.Context, id string, providerResponse []byte, providerEmailID string) error
 	// MarkSkipped finalizes a delivery as skipped — nothing to deliver to
 	// (e.g. no push subscriptions) — which is not a failure and is never
 	// retried.
@@ -59,18 +62,23 @@ func NewPGStore(pool *pgxpool.Pool) *PGStore {
 	return &PGStore{pool: pool}
 }
 
-const deliveryColumns = `id, notification_id, tenant_id, recipient_user_id, channel, status, attempts, max_attempts, next_attempt_at, last_error, provider_response, created_at, updated_at`
+const deliveryColumns = `id, notification_id, tenant_id, recipient_user_id, channel, status, attempts, max_attempts, next_attempt_at, last_error, provider_response, provider_status, provider_status_at, created_at, updated_at`
 
 func scanDelivery(row pgx.Row) (*Delivery, error) {
 	var d Delivery
 	var recipientUserID *string
 	var lastError *string
+	var providerStatus *string
 	if err := row.Scan(
 		&d.ID, &d.NotificationID, &d.TenantID, &recipientUserID, &d.Channel, &d.Status,
 		&d.Attempts, &d.MaxAttempts, &d.NextAttemptAt, &lastError, &d.ProviderResponse,
+		&providerStatus, &d.ProviderStatusAt,
 		&d.CreatedAt, &d.UpdatedAt,
 	); err != nil {
 		return nil, err
+	}
+	if providerStatus != nil {
+		d.ProviderStatus = *providerStatus
 	}
 	if recipientUserID != nil {
 		d.RecipientUserID = *recipientUserID
@@ -116,8 +124,23 @@ func (s *PGStore) ClaimPending(ctx context.Context, batchSize int) ([]Delivery, 
 
 func (s *PGStore) ClaimDue(ctx context.Context, batchSize int, staleProcessingAfter time.Duration) ([]Delivery, error) {
 	staleBefore := time.Now().Add(-staleProcessingAfter)
+
+	// A row stuck in 'processing' was an attempt that never reported back
+	// (crash, panic). Count it, and terminate rows that have used their whole
+	// budget so a poison delivery cannot be reclaimed forever.
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE notification_deliveries
+		SET status = 'failed', attempts = attempts + 1,
+		    last_error = 'abandoned while processing (worker crashed or timed out)', updated_at = NOW()
+		WHERE status = 'processing' AND updated_at <= $1 AND attempts + 1 >= $2`,
+		staleBefore, MaxAttempts); err != nil {
+		return nil, fmt.Errorf("fail exhausted stale deliveries: %w", err)
+	}
+
 	return s.claim(ctx, `
-		UPDATE notification_deliveries SET status = 'processing', updated_at = NOW()
+		UPDATE notification_deliveries
+		SET attempts = CASE WHEN status = 'processing' THEN attempts + 1 ELSE attempts END,
+		    status = 'processing', updated_at = NOW()
 		WHERE id IN (
 			SELECT id FROM notification_deliveries
 			WHERE (status = 'retrying' AND next_attempt_at <= NOW())
@@ -150,11 +173,11 @@ func (s *PGStore) claim(ctx context.Context, query string, args ...any) ([]Deliv
 	return out, nil
 }
 
-func (s *PGStore) MarkSent(ctx context.Context, id string, providerResponse []byte) error {
+func (s *PGStore) MarkSent(ctx context.Context, id string, providerResponse []byte, providerEmailID string) error {
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE notification_deliveries
-		SET status = 'sent', provider_response = $2, updated_at = NOW()
-		WHERE id = $1`, id, providerResponse); err != nil {
+		SET status = 'sent', provider_response = $2, provider_email_id = NULLIF($3, ''), updated_at = NOW()
+		WHERE id = $1 AND status = 'processing'`, id, providerResponse, providerEmailID); err != nil {
 		return fmt.Errorf("mark delivery %s sent: %w", id, err)
 	}
 	return nil
@@ -164,7 +187,7 @@ func (s *PGStore) MarkSkipped(ctx context.Context, id string, providerResponse [
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE notification_deliveries
 		SET status = 'skipped', provider_response = $2, updated_at = NOW()
-		WHERE id = $1`, id, providerResponse); err != nil {
+		WHERE id = $1 AND status = 'processing'`, id, providerResponse); err != nil {
 		return fmt.Errorf("mark delivery %s skipped: %w", id, err)
 	}
 	return nil
@@ -179,8 +202,8 @@ func (s *PGStore) MarkRetrying(ctx context.Context, id string, attempts int, las
 
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE notification_deliveries
-		SET status = $2, attempts = $3, next_attempt_at = $4, last_error = $5, provider_response = $6, updated_at = NOW()
-		WHERE id = $1`,
+		SET status = $2, attempts = $3, next_attempt_at = $4, last_error = $5, provider_response = COALESCE($6, provider_response), updated_at = NOW()
+		WHERE id = $1 AND status = 'processing'`,
 		id, status, attempts, nextAttempt, lastError, providerResponse); err != nil {
 		return fmt.Errorf("mark delivery %s retrying: %w", id, err)
 	}

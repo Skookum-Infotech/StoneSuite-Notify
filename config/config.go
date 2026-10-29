@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 )
@@ -33,6 +34,20 @@ type Config struct {
 	// email. Optional: transactional mail with a real reply address scores
 	// better with spam filters than a bare no-reply From. Unset ⇒ no header.
 	EmailReplyTo string
+	// ResendWebhookSecret is the signing secret ("whsec_…") Resend shows when a
+	// webhook endpoint is created. It authenticates POST /api/webhooks/resend,
+	// which has no other gate. Optional: unset ⇒ the route answers 503.
+	ResendWebhookSecret string
+
+	// Inbound customer replies (the Communication tab). Resend receives mail on
+	// ReplyEmailDomain and posts email.received to the same webhook as delivery
+	// events; this service fetches the mail's content from Resend and forwards it
+	// to StoneSuite-Backend at BackendURL, signed with InternalServiceSecret. It
+	// must equal StoneSuite-Backend's REPLY_EMAIL_DOMAIN. Optional: either unset
+	// ⇒ received mail is acknowledged and dropped.
+	ReplyEmailDomain string
+	BackendURL       string
+
 	SMTPHost     string
 	SMTPPort     string
 	SMTPUsername string
@@ -59,6 +74,12 @@ func Load() (Config, error) {
 		ResendAPIKey: os.Getenv("RESEND_API_KEY"),
 		EmailFrom:    os.Getenv("EMAIL_FROM"),
 		EmailReplyTo: os.Getenv("EMAIL_REPLY_TO"),
+
+		ResendWebhookSecret: os.Getenv("RESEND_WEBHOOK_SECRET"),
+
+		ReplyEmailDomain: strings.ToLower(strings.TrimSpace(os.Getenv("REPLY_EMAIL_DOMAIN"))),
+		BackendURL:       strings.TrimRight(strings.TrimSpace(os.Getenv("BACKEND_URL")), "/"),
+
 		SMTPHost:     os.Getenv("SMTP_HOST"),
 		SMTPPort:     getEnv("SMTP_PORT", "587"),
 		SMTPUsername: os.Getenv("SMTP_USERNAME"),
@@ -77,6 +98,13 @@ func Load() (Config, error) {
 	}
 	if cfg.InternalServiceSecret == "" {
 		return Config{}, fmt.Errorf("INTERNAL_SERVICE_SECRET is required")
+	}
+	// A BACKEND_URL that is not an absolute http(s) URL would silently drop every
+	// customer reply at forward time; fail at boot instead.
+	if cfg.BackendURL != "" {
+		if u, err := url.Parse(cfg.BackendURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return Config{}, fmt.Errorf("BACKEND_URL must be an absolute http(s) URL, got %q", cfg.BackendURL)
+		}
 	}
 
 	// Email and push are optional channels: if unconfigured, the service
@@ -103,6 +131,19 @@ func (c Config) EmailSendable() bool {
 // PushConfigured reports whether VAPID keys are present for web push.
 func (c Config) PushConfigured() bool {
 	return c.VAPIDPublicKey != "" && c.VAPIDPrivateKey != ""
+}
+
+// ResendWebhookConfigured reports whether provider delivery webhooks can be
+// verified (a signing secret is set).
+func (c Config) ResendWebhookConfigured() bool {
+	return c.ResendWebhookSecret != ""
+}
+
+// InboundConfigured reports whether a received customer reply can be handled:
+// the reply domain to accept mail for, the backend to forward it to, and the
+// Resend key that fetches the mail's content.
+func (c Config) InboundConfigured() bool {
+	return c.ReplyEmailDomain != "" && c.BackendURL != "" && c.ResendAPIKey != ""
 }
 
 func getEnv(key, fallback string) string {

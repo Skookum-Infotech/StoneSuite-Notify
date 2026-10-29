@@ -6,10 +6,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"net/mail"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"stonesuite-notify/audit"
 	"stonesuite-notify/config"
@@ -227,26 +231,100 @@ type createNotificationRequest struct {
 	Title       string            `json:"title"`
 	Body        string            `json:"body,omitempty"`
 	Link        string            `json:"link,omitempty"`
+	// StatusLink is the staff-side page a delivery-problem alert for this
+	// notification's email links to. Optional; at most maxStatusLinkChars.
+	StatusLink string `json:"statusLink,omitempty"`
+	// StatusResource is the RBAC resource that governs that page. Optional; at
+	// most maxStatusResourceChars.
+	StatusResource string `json:"statusResource,omitempty"`
 	Channels    []string          `json:"channels,omitempty"`
 	// EmailBodyHTML, when set, is used verbatim as the email's HTML body
 	// instead of the generic <h2>title</h2><p>body</p> template — see
 	// channels.SendNotificationEmail.
 	EmailBodyHTML string `json:"emailBodyHtml,omitempty"`
 	// Attachments matches StoneSuite-Backend's services.NotificationRequest
-	// wire shape (a plural array under "attachments") — only the first entry
-	// is used, since a notification carries at most one file today
-	// (notification_attachments is one row per notification_id).
+	// wire shape (a plural array under "attachments"): every entry is attached,
+	// in order, up to maxEmailAttachments files and maxEmailAttachmentBytes in
+	// total once decoded.
 	Attachments []attachmentInput `json:"attachments,omitempty"`
+	// Per-message email header overrides — see notifications.EmailOptions.
+	// EmailReplyTo routes the customer's reply to a specific record's
+	// inbound address; EmailFromName shows a person ("Harish (Acme)") as the
+	// sender; EmailInReplyTo/EmailReferences keep a reply in its mail thread.
+	EmailReplyTo    string `json:"emailReplyTo,omitempty"`
+	EmailFromName   string `json:"emailFromName,omitempty"`
+	EmailInReplyTo  string `json:"emailInReplyTo,omitempty"`
+	EmailReferences string `json:"emailReferences,omitempty"`
+}
+
+// emailOptions validates and converts the request's header overrides. A value
+// containing CR/LF is rejected outright (header injection), and the reply-to
+// must be a single well-formed address.
+func (r createNotificationRequest) emailOptions() (notifications.EmailOptions, error) {
+	opts := notifications.EmailOptions{
+		ReplyTo:    strings.TrimSpace(r.EmailReplyTo),
+		FromName:   strings.TrimSpace(r.EmailFromName),
+		InReplyTo:  strings.TrimSpace(r.EmailInReplyTo),
+		References: strings.TrimSpace(r.EmailReferences),
+	}
+	limits := []struct {
+		name  string
+		value string
+		max   int
+	}{
+		{"emailReplyTo", opts.ReplyTo, maxEmailReplyToChars},
+		{"emailFromName", opts.FromName, maxEmailFromNameChars},
+		{"emailInReplyTo", opts.InReplyTo, maxEmailMessageIDChars},
+		{"emailReferences", opts.References, maxEmailReferencesChars},
+	}
+	for _, f := range limits {
+		if strings.ContainsAny(f.value, "\r\n") {
+			return notifications.EmailOptions{}, errors.New(f.name + " must not contain line breaks.")
+		}
+		if utf8.RuneCountInString(f.value) > f.max {
+			return notifications.EmailOptions{}, errors.New(f.name + " is too long.")
+		}
+	}
+	if opts.ReplyTo != "" {
+		if _, err := mail.ParseAddress(opts.ReplyTo); err != nil {
+			return notifications.EmailOptions{}, errors.New("emailReplyTo must be a valid email address.")
+		}
+	}
+	return opts, nil
 }
 
 const channelEmail = "email"
+
+// Widths of notifications.status_link and notifications.status_resource.
+const (
+	maxStatusLinkChars     = 300
+	maxStatusResourceChars = 64
+)
+
+// Bounds on the files of one email. The size is a sanity bound well under
+// Resend's 40 MB per email after Base64 (about 30 MB of files), not a product
+// limit: StoneSuite-Backend enforces the 5 MB a staff reply may carry, and a
+// rendered document PDF has never been capped here.
+const (
+	maxEmailAttachments     = 5
+	maxEmailAttachmentBytes = 25 << 20
+)
+
+// Bounds on the per-message email header overrides. References can carry a
+// whole thread's Message-IDs, so it gets the most room.
+const (
+	maxEmailReplyToChars    = 254
+	maxEmailFromNameChars   = 100
+	maxEmailMessageIDChars  = 998
+	maxEmailReferencesChars = 4000
+)
 
 // Create handles POST /api/notifications/internal — called by another
 // StoneSuite service (not an end user) when a business event fires. Gated
 // by middleware.RequireInternalSecret rather than end-user auth.
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	var req createNotificationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxCreateBodyBytes)).Decode(&req); err != nil {
 		fail(w, http.StatusBadRequest, "Invalid request body.")
 		return
 	}
@@ -259,20 +337,50 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "recipients is required.")
 		return
 	}
+	if len(req.Recipients) > maxRecipients {
+		fail(w, http.StatusBadRequest, "too many recipients.")
+		return
+	}
+	if utf8.RuneCountInString(req.StatusLink) > maxStatusLinkChars {
+		fail(w, http.StatusBadRequest, "statusLink must be at most 300 characters.")
+		return
+	}
+	if utf8.RuneCountInString(req.StatusResource) > maxStatusResourceChars {
+		fail(w, http.StatusBadRequest, "statusResource must be at most 64 characters.")
+		return
+	}
+
+	emailOpts, optsErr := req.emailOptions()
+	if optsErr != nil {
+		fail(w, http.StatusBadRequest, optsErr.Error())
+		return
+	}
 
 	var attachment *notifications.AttachmentInput
-	if len(req.Attachments) > 0 || req.EmailBodyHTML != "" {
-		attachment = &notifications.AttachmentInput{EmailBodyHTML: req.EmailBodyHTML}
-		if len(req.Attachments) > 0 {
-			a := req.Attachments[0]
+	if len(req.Attachments) > 0 || req.EmailBodyHTML != "" || !emailOpts.IsZero() {
+		attachment = &notifications.AttachmentInput{EmailBodyHTML: req.EmailBodyHTML, EmailOptions: emailOpts}
+		if len(req.Attachments) > maxEmailAttachments {
+			fail(w, http.StatusBadRequest, fmt.Sprintf("attachments must have at most %d files.", maxEmailAttachments))
+			return
+		}
+		var total int
+		for i, a := range req.Attachments {
 			content, decErr := base64.StdEncoding.DecodeString(a.ContentBase64)
 			if decErr != nil {
-				fail(w, http.StatusBadRequest, "attachments[0].contentBase64 is not valid base64.")
+				fail(w, http.StatusBadRequest, fmt.Sprintf("attachments[%d].contentBase64 is not valid base64.", i))
 				return
 			}
-			attachment.FileName = a.FileName
-			attachment.ContentType = a.ContentType
-			attachment.Content = content
+			if total += len(content); total > maxEmailAttachmentBytes {
+				fail(w, http.StatusBadRequest, fmt.Sprintf("attachments must total at most %d MB.", maxEmailAttachmentBytes>>20))
+				return
+			}
+			if i == 0 {
+				attachment.FileName, attachment.ContentType, attachment.Content = a.FileName, a.ContentType, content
+				continue
+			}
+			attachment.MoreFiles = append(attachment.MoreFiles, notifications.AttachmentFile{
+				FileName: a.FileName, ContentType: a.ContentType, Content: content,
+			})
 		}
 	}
 
@@ -298,6 +406,8 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 			Title:           req.Title,
 			Body:            req.Body,
 			Link:            req.Link,
+			StatusLink:      req.StatusLink,
+			StatusResource:  req.StatusResource,
 		}
 		if err := in.Validate(); err != nil {
 			fail(w, http.StatusBadRequest, err.Error())

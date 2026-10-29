@@ -2,6 +2,7 @@ package notifications
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -38,10 +39,10 @@ type Store interface {
 	// so resource-restricted rows are never marked read without the
 	// recipient having actually been able to see them.
 	MarkAllRead(ctx context.Context, tenantID, recipientUserID string, allowedResources []string) error
-	// SaveAttachment persists the single attachment for a notification's
-	// email delivery. Called at most once per notification, from
-	// controllers.Handler.Create, only when email delivery was actually
-	// requested for that recipient.
+	// SaveAttachment persists the attachments (files, custom body, header
+	// options) for a notification's email delivery. Called at most once per
+	// notification, from controllers.Handler.Create, only when email delivery
+	// was actually requested for that recipient.
 	SaveAttachment(ctx context.Context, notificationID string, a AttachmentInput) error
 	// GetAttachment loads a notification's attachment, if any. Returns
 	// (nil, nil) — not an error — when the notification has none, since
@@ -97,10 +98,10 @@ func (s *PGStore) Create(ctx context.Context, in CreateInput) (*Notification, er
 
 	row := s.pool.QueryRow(ctx, `
 		INSERT INTO notifications
-			(tenant_id, recipient_user_id, recipient_email, actor_user_id, event_type, resource, resource_id, title, body, link, visible_in_app)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			(tenant_id, recipient_user_id, recipient_email, actor_user_id, event_type, resource, resource_id, title, body, link, visible_in_app, status_link, status_resource)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING `+notificationColumns,
-		in.TenantID, recipientUserIDArg, in.RecipientEmail, actorUserIDArg, in.EventType, in.Resource, in.ResourceID, in.Title, in.Body, in.Link, in.VisibleInApp)
+		in.TenantID, recipientUserIDArg, in.RecipientEmail, actorUserIDArg, in.EventType, in.Resource, in.ResourceID, in.Title, in.Body, in.Link, in.VisibleInApp, in.StatusLink, in.StatusResource)
 
 	n, err := scanNotification(row)
 	if err != nil {
@@ -127,9 +128,26 @@ func (s *PGStore) Get(ctx context.Context, tenantID, id string) (*Notification, 
 	return n, nil
 }
 
+// nonNilResources returns allowedResources unchanged, except a nil slice
+// becomes a non-nil empty one. pgx binds a nil Go slice as SQL NULL for a
+// text[] parameter, and cardinality(NULL::text[]) is NULL, not 0 — so the
+// query's "cardinality($n::text[]) = 0" unrestricted-fallback silently
+// evaluates to NULL (falsy in a WHERE clause) instead of true, turning
+// "no restriction" into "match nothing". A real empty array avoids that:
+// cardinality('{}'::text[]) = 0. allowedResources is nil for every caller
+// until StoneSuite-Backend mints a non-empty accessible_resources claim, so
+// this affected every account, not just resource-restricted ones.
+func nonNilResources(allowedResources []string) []string {
+	if allowedResources == nil {
+		return []string{}
+	}
+	return allowedResources
+}
+
 // ListForUser returns one page of the recipient's notifications, newest
 // first.
 func (s *PGStore) ListForUser(ctx context.Context, tenantID, recipientUserID string, allowedResources []string, unreadOnly bool, limit, offset int) ([]Notification, error) {
+	allowedResources = nonNilResources(allowedResources)
 	limit, offset = NormalizePaging(limit, offset)
 
 	query := `SELECT ` + notificationColumns + `
@@ -167,6 +185,7 @@ func (s *PGStore) ListForUser(ctx context.Context, tenantID, recipientUserID str
 // CountForUser returns the total number of feed rows matching the same
 // filter ListForUser applies, ignoring paging.
 func (s *PGStore) CountForUser(ctx context.Context, tenantID, recipientUserID string, allowedResources []string, unreadOnly bool) (int, error) {
+	allowedResources = nonNilResources(allowedResources)
 	query := `SELECT COUNT(*) FROM notifications
 		WHERE tenant_id = $1 AND recipient_user_id = $2 AND visible_in_app = true
 		AND (cardinality($3::text[]) = 0 OR resource = ANY($3::text[]))`
@@ -184,6 +203,7 @@ func (s *PGStore) CountForUser(ctx context.Context, tenantID, recipientUserID st
 // UnreadCount returns the number of unread notifications for the recipient —
 // the value the frontend bell polls.
 func (s *PGStore) UnreadCount(ctx context.Context, tenantID, recipientUserID string, allowedResources []string) (int, error) {
+	allowedResources = nonNilResources(allowedResources)
 	var count int
 	err := s.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM notifications
@@ -215,6 +235,7 @@ func (s *PGStore) MarkRead(ctx context.Context, tenantID, recipientUserID, id st
 // MarkAllRead marks every unread notification within allowedResources for
 // the recipient as read (empty allowedResources means unrestricted).
 func (s *PGStore) MarkAllRead(ctx context.Context, tenantID, recipientUserID string, allowedResources []string) error {
+	allowedResources = nonNilResources(allowedResources)
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE notifications SET read_at = NOW()
 		WHERE tenant_id = $1 AND recipient_user_id = $2 AND read_at IS NULL
@@ -226,25 +247,56 @@ func (s *PGStore) MarkAllRead(ctx context.Context, tenantID, recipientUserID str
 }
 
 // SaveAttachment inserts (or replaces, on the rare case of a retry)
-// notification_id's attachment row. content defaults to an empty (not
-// NULL) byte slice when only a.EmailBodyHTML is set and there is no actual
-// file, since the column is NOT NULL.
+// notification_id's attachment row, and its further files, in one
+// transaction. content defaults to an empty (not NULL) byte slice when only
+// a.EmailBodyHTML is set and there is no actual file, since the column is NOT
+// NULL. A replace drops the files of the earlier save, so a retry never mixes
+// two sets.
 func (s *PGStore) SaveAttachment(ctx context.Context, notificationID string, a AttachmentInput) error {
 	content := a.Content
 	if content == nil {
 		content = []byte{}
 	}
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO notification_attachments (notification_id, file_name, content_type, content, email_body_html)
-		VALUES ($1, $2, $3, $4, $5)
+	options, err := json.Marshal(a.EmailOptions)
+	if err != nil {
+		return fmt.Errorf("encode email options for notification %s: %w", notificationID, err)
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin save of notification attachment %s: %w", notificationID, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO notification_attachments (notification_id, file_name, content_type, content, email_body_html, email_options)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (notification_id) DO UPDATE
 			SET file_name = EXCLUDED.file_name,
 			    content_type = EXCLUDED.content_type,
 			    content = EXCLUDED.content,
-			    email_body_html = EXCLUDED.email_body_html`,
-		notificationID, a.FileName, a.ContentType, content, a.EmailBodyHTML)
-	if err != nil {
+			    email_body_html = EXCLUDED.email_body_html,
+			    email_options = EXCLUDED.email_options`,
+		notificationID, a.FileName, a.ContentType, content, a.EmailBodyHTML, options); err != nil {
 		return fmt.Errorf("save notification attachment %s: %w", notificationID, err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM notification_attachment_files WHERE notification_id = $1`, notificationID); err != nil {
+		return fmt.Errorf("clear further files of notification %s: %w", notificationID, err)
+	}
+	for i, f := range a.MoreFiles {
+		fileContent := f.Content
+		if fileContent == nil {
+			fileContent = []byte{}
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO notification_attachment_files (notification_id, position, file_name, content_type, content)
+			VALUES ($1, $2, $3, $4, $5)`,
+			notificationID, i, f.FileName, f.ContentType, fileContent); err != nil {
+			return fmt.Errorf("save file %d of notification %s: %w", i+2, notificationID, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit notification attachment %s: %w", notificationID, err)
 	}
 	return nil
 }
@@ -256,17 +308,41 @@ func (s *PGStore) SaveAttachment(ctx context.Context, notificationID string, a A
 // the common case.
 func (s *PGStore) GetAttachment(ctx context.Context, tenantID, notificationID string) (*AttachmentInput, error) {
 	var a AttachmentInput
+	var options []byte
 	err := s.pool.QueryRow(ctx, `
-		SELECT na.file_name, na.content_type, na.content, na.email_body_html
+		SELECT na.file_name, na.content_type, na.content, na.email_body_html, na.email_options
 		FROM notification_attachments na
 		JOIN notifications n ON n.id = na.notification_id
 		WHERE na.notification_id = $1 AND n.tenant_id = $2`,
-		notificationID, tenantID).Scan(&a.FileName, &a.ContentType, &a.Content, &a.EmailBodyHTML)
+		notificationID, tenantID).Scan(&a.FileName, &a.ContentType, &a.Content, &a.EmailBodyHTML, &options)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("get notification attachment %s: %w", notificationID, err)
+	}
+	if len(options) > 0 {
+		if err := json.Unmarshal(options, &a.EmailOptions); err != nil {
+			return nil, fmt.Errorf("decode email options for notification %s: %w", notificationID, err)
+		}
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT file_name, content_type, content FROM notification_attachment_files
+		WHERE notification_id = $1 ORDER BY position`, notificationID)
+	if err != nil {
+		return nil, fmt.Errorf("get further files of notification %s: %w", notificationID, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var f AttachmentFile
+		if err := rows.Scan(&f.FileName, &f.ContentType, &f.Content); err != nil {
+			return nil, fmt.Errorf("scan further file of notification %s: %w", notificationID, err)
+		}
+		a.MoreFiles = append(a.MoreFiles, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate further files of notification %s: %w", notificationID, err)
 	}
 	return &a, nil
 }
