@@ -77,9 +77,9 @@ check "update preferences" "$(curl -s -X PUT "$BASE_URL/api/preferences" -H "Aut
 echo "== Push channel =="
 check "vapid public key" "$(curl -s "$BASE_URL/api/push/vapid-public-key")" '"publicKey"'
 SUB_RESP=$(curl -s -X POST "$BASE_URL/api/push/subscribe" -H "Authorization: Bearer $USER_TOKEN" -H "Content-Type: application/json" \
-  -d "{\"endpoint\":\"http://localhost:9/smoke-test-unreachable\",\"keys\":{\"p256dh\":\"${VAPID_PUBLIC_KEY:-}\",\"auth\":\"AAAAAAAAAAAAAAAAAAAAAA\"}}")
+  -d "{\"endpoint\":\"https://push.smoke-test.invalid/smoke-test-unreachable\",\"keys\":{\"p256dh\":\"${VAPID_PUBLIC_KEY:-}\",\"auth\":\"AAAAAAAAAAAAAAAAAAAAAA\"}}")
 check "push subscribe succeeds" "$SUB_RESP" '"success":true'
-check "push unsubscribe succeeds" "$(curl -s -X DELETE "$BASE_URL/api/push/subscribe" -H "Authorization: Bearer $USER_TOKEN" -H "Content-Type: application/json" -d '{"endpoint":"http://localhost:9/smoke-test-unreachable"}')" '"success":true'
+check "push unsubscribe succeeds" "$(curl -s -X DELETE "$BASE_URL/api/push/subscribe" -H "Authorization: Bearer $USER_TOKEN" -H "Content-Type: application/json" -d '{"endpoint":"https://push.smoke-test.invalid/smoke-test-unreachable"}')" '"success":true'
 
 echo "== Admin & audit =="
 check "admin tenant-defaults readable" "$(curl -s "$BASE_URL/api/admin/tenant-defaults" -H "Authorization: Bearer $ADMIN_TOKEN")" '"defaults"'
