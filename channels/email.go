@@ -276,6 +276,20 @@ func sendViaResend(cfg config.Config, to, subject, htmlBody, textBody string, at
 	return accepted.ID, nil
 }
 
+// smtpEnvelopeFrom returns the bare address for the SMTP MAIL FROM command.
+// EMAIL_FROM may carry a display name ("StoneSuite <notifications@example.com>",
+// the form Resend accepts and the README recommends), but MAIL FROM takes only
+// an address: servers reject the whole "Name <addr>" string as an invalid FROM
+// parameter. A value that does not parse is passed through unchanged so the
+// server, not this function, decides whether it is acceptable.
+func smtpEnvelopeFrom(emailFrom string) string {
+	parsed, err := mail.ParseAddress(emailFrom)
+	if err != nil {
+		return emailFrom
+	}
+	return parsed.Address
+}
+
 func sendViaSMTP(cfg config.Config, to, subject, htmlBody, textBody string, attachments []EmailAttachment, opts EmailOptions) error {
 	addr := cfg.SMTPHost + ":" + cfg.SMTPPort
 	msg := buildSMTPMessage(to, opts.from(cfg), opts.replyTo(cfg), subject, htmlBody, textBody, attachments, opts)
@@ -285,7 +299,7 @@ func sendViaSMTP(cfg config.Config, to, subject, htmlBody, textBody string, atta
 		auth = smtp.PlainAuth("", cfg.SMTPUsername, cfg.SMTPPassword, cfg.SMTPHost)
 	}
 
-	if err := smtp.SendMail(addr, auth, cfg.EmailFrom, []string{to}, msg); err != nil {
+	if err := smtp.SendMail(addr, auth, smtpEnvelopeFrom(cfg.EmailFrom), []string{to}, msg); err != nil {
 		return fmt.Errorf("smtp: send: %w", err)
 	}
 	return nil
